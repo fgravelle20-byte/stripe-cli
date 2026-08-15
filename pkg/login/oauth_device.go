@@ -13,6 +13,7 @@ import (
 
 	"github.com/stripe/stripe-cli/pkg/ansi"
 	"github.com/stripe/stripe-cli/pkg/config"
+	"github.com/stripe/stripe-cli/pkg/errorcategory"
 )
 
 const (
@@ -84,7 +85,7 @@ func RequestDeviceCode(ctx context.Context, accessBaseURL, clientID string) (*De
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("device authorization request failed (status %d): %s", resp.StatusCode, string(body))
+		return nil, errorcategory.Errorf(errorcategory.Auth, "device authorization request failed (status %d): %s", resp.StatusCode, string(body))
 	}
 
 	var authResp DeviceAuthResponse
@@ -134,7 +135,7 @@ func PollDeviceToken(ctx context.Context, accessBaseURL, clientID, deviceCode st
 
 		var errResp tokenErrorResponse
 		if jsonErr := json.Unmarshal(body, &errResp); jsonErr != nil || errResp.Error == "" {
-			return nil, fmt.Errorf("token request failed (status %d): %s", resp.StatusCode, string(body))
+			return nil, errorcategory.Errorf(errorcategory.Auth, "token request failed (status %d): %s", resp.StatusCode, string(body))
 		}
 
 		oauthErr := &OAuthError{Code: errResp.Error, Description: errResp.ErrorDescription, HTTPStatus: resp.StatusCode}
@@ -174,6 +175,9 @@ func LoginWithDeviceCode(ctx context.Context, accessBaseURL string, cfg *config.
 	if err != nil {
 		return fmt.Errorf("failed to request device code: %w", err)
 	}
+	if err := validateBrowserURL(authResp.VerificationURI, accessBaseURL); err != nil {
+		return err
+	}
 
 	color := ansi.Color(os.Stdout)
 	fmt.Printf("Your pairing code is: %s\n", color.Bold(authResp.UserCode))
@@ -198,7 +202,7 @@ func LoginWithDeviceCode(ctx context.Context, accessBaseURL string, cfg *config.
 	tokenResp, err := PollDeviceToken(pollCtx, accessBaseURL, clientID, authResp.DeviceCode, interval)
 	if err != nil {
 		if pollCtx.Err() != nil {
-			return fmt.Errorf("device code expired; please run 'stripe login' again")
+			return errorcategory.Errorf(errorcategory.Auth, "device code expired; please run 'stripe login' again")
 		}
 		return err
 	}
@@ -335,7 +339,7 @@ func RefreshAccessToken(ctx context.Context, accessBaseURL, clientID, refreshTok
 		return nil, &OAuthError{Code: errResp.Error, Description: errResp.ErrorDescription, HTTPStatus: resp.StatusCode}
 	}
 
-	return nil, fmt.Errorf("refresh token request failed (status %d): %s", resp.StatusCode, string(body))
+	return nil, errorcategory.Errorf(errorcategory.Auth, "refresh token request failed (status %d): %s", resp.StatusCode, string(body))
 }
 
 func doPostForm(ctx context.Context, endpoint string, data url.Values) (*http.Response, error) {
@@ -344,5 +348,5 @@ func doPostForm(ctx context.Context, endpoint string, data url.Values) (*http.Re
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	return http.DefaultClient.Do(req)
+	return accessSrvHTTPClient.Do(req)
 }

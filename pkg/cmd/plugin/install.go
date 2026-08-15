@@ -18,6 +18,7 @@ import (
 	"github.com/stripe/stripe-cli/pkg/ansi"
 	"github.com/stripe/stripe-cli/pkg/cmd/plugin/postinstall"
 	"github.com/stripe/stripe-cli/pkg/config"
+	"github.com/stripe/stripe-cli/pkg/errorcategory"
 	"github.com/stripe/stripe-cli/pkg/login"
 	"github.com/stripe/stripe-cli/pkg/plugins"
 	"github.com/stripe/stripe-cli/pkg/stripe"
@@ -91,6 +92,9 @@ func (ic *InstallCmd) runInstallCmd(cmd *cobra.Command, args []string) error {
 	if err := stripe.ValidateDashboardBaseURL(dashboardBaseURL); err != nil {
 		return err
 	}
+	if err := login.ValidateAccessBaseURL(ic.accessBaseURL); err != nil {
+		return err
+	}
 
 	color := ansi.Color(os.Stdout)
 	pluginName, version := parseInstallArg(args[0])
@@ -107,17 +111,17 @@ func (ic *InstallCmd) runInstallCmd(cmd *cobra.Command, args []string) error {
 				var input string
 				fmt.Fscanln(os.Stdin, &input)
 				if input != "" {
-					return fmt.Errorf("login canceled")
+					return errorcategory.Errorf(errorcategory.UserInput, "login canceled")
 				}
 				if lErr := login.Login(cmd.Context(), dashboardBaseURL, ic.accessBaseURL, ic.cfg); lErr != nil {
 					return lErr
 				}
 				resolvedPlugin, err = plugins.ResolvePluginForInstall(cmd.Context(), ic.cfg, ic.fs, pluginName, version, ic.apiBaseURL, dashboardBaseURL)
 				if err != nil {
-					return fmt.Errorf("no plugin named %q exists", pluginName)
+					return errorcategory.Errorf(errorcategory.UserInput, "no plugin named %q exists", pluginName)
 				}
 			} else {
-				return fmt.Errorf("no plugin named %q exists", pluginName)
+				return errorcategory.Errorf(errorcategory.UserInput, "no plugin named %q exists", pluginName)
 			}
 		} else {
 			accountID, aErr := ic.cfg.GetProfile().GetAccountID()
@@ -127,7 +131,7 @@ func (ic *InstallCmd) runInstallCmd(cmd *cobra.Command, args []string) error {
 				var input string
 				fmt.Fscanln(os.Stdin, &input)
 				if input != "" {
-					return fmt.Errorf("login canceled")
+					return errorcategory.Errorf(errorcategory.UserInput, "login canceled")
 				}
 				if lErr := login.Login(cmd.Context(), dashboardBaseURL, ic.accessBaseURL, ic.cfg); lErr != nil {
 					return lErr

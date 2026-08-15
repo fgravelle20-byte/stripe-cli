@@ -14,6 +14,7 @@ import (
 	"github.com/stripe/stripe-cli/pkg/ansi"
 	"github.com/stripe/stripe-cli/pkg/cmd/plugin/postinstall"
 	"github.com/stripe/stripe-cli/pkg/config"
+	"github.com/stripe/stripe-cli/pkg/errorcategory"
 	"github.com/stripe/stripe-cli/pkg/login"
 	"github.com/stripe/stripe-cli/pkg/open"
 	"github.com/stripe/stripe-cli/pkg/plugins"
@@ -141,6 +142,10 @@ func newPluginHintCmd(cfg *config.Config, name, description string, opts ...opti
 }
 
 func (p *pluginHintCmd) run(cmd *cobra.Command, args []string) error {
+	if err := login.ValidateAccessBaseURL(p.accessBaseURL); err != nil {
+		return err
+	}
+
 	ctx := cmd.Context()
 	if ctx == nil {
 		ctx = context.Background()
@@ -175,7 +180,7 @@ func (p *pluginHintCmd) promptInstall(ctx context.Context) error {
 	fmt.Fscanln(p.stdin, &input)
 
 	if input != "" {
-		return fmt.Errorf("installation canceled")
+		return errorcategory.Errorf(errorcategory.UserInput, "installation canceled")
 	}
 
 	if err := p.installFn(ctx); err != nil {
@@ -198,7 +203,7 @@ func (p *pluginHintCmd) promptLogin(ctx context.Context) error {
 	fmt.Fscanln(p.stdin, &input)
 
 	if input != "" {
-		return fmt.Errorf("login canceled")
+		return errorcategory.Errorf(errorcategory.UserInput, "login canceled")
 	}
 
 	return p.loginFn(ctx)

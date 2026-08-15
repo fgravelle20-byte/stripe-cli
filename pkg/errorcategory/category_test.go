@@ -16,6 +16,26 @@ func (e *testError) Error() string {
 	return e.message
 }
 
+func TestNew(t *testing.T) {
+	err := New(UserInput, "invalid input")
+
+	require.EqualError(t, err, "invalid input")
+	category, ok := Get(err)
+	require.True(t, ok)
+	require.Equal(t, UserInput, category)
+}
+
+func TestErrorf(t *testing.T) {
+	target := &testError{message: "target"}
+	err := Errorf(Network, "request failed: %w", target)
+
+	require.EqualError(t, err, "request failed: target")
+	require.ErrorIs(t, err, target)
+	category, ok := Get(err)
+	require.True(t, ok)
+	require.Equal(t, Network, category)
+}
+
 func TestWith(t *testing.T) {
 	target := &testError{message: "unchanged message"}
 	err := With(target, Auth)
@@ -46,6 +66,16 @@ func TestGetWithoutCategory(t *testing.T) {
 	category, ok := Get(errors.New("uncategorized"))
 	require.False(t, ok)
 	require.Empty(t, category)
+}
+
+func TestUserInputErrorf(t *testing.T) {
+	err := UserInputErrorf("invalid %s: %q", "value", "foo")
+
+	require.EqualError(t, err, `invalid value: "foo"`)
+
+	category, ok := Get(err)
+	require.True(t, ok)
+	require.Equal(t, UserInput, category)
 }
 
 func TestGetUsesOutermostCategory(t *testing.T) {

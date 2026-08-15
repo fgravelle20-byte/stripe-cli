@@ -1,11 +1,11 @@
 package validators
 
 import (
-	"errors"
-	"fmt"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/stripe/stripe-cli/pkg/errorcategory"
 )
@@ -16,13 +16,13 @@ type ArgValidator func(string) error
 
 var (
 	// ErrAPIKeyNotConfigured is the error returned when the loaded profile is missing the api key property
-	ErrAPIKeyNotConfigured = errorcategory.With(errors.New("you have not configured API keys yet"), errorcategory.Auth)
+	ErrAPIKeyNotConfigured = errorcategory.New(errorcategory.Auth, "you have not configured API keys yet")
 	// ErrPubKeyNotConfigured is the error returned when the loaded profile is missing the publishable key property
-	ErrPubKeyNotConfigured = errorcategory.With(errors.New("you have not configured publishable keys yet"), errorcategory.Auth)
+	ErrPubKeyNotConfigured = errorcategory.New(errorcategory.Auth, "you have not configured publishable keys yet")
 	// ErrDeviceNameNotConfigured is the error returned when the loaded profile is missing the device name property
-	ErrDeviceNameNotConfigured = errors.New("you have not configured your device name yet")
+	ErrDeviceNameNotConfigured = errorcategory.New(errorcategory.UserInput, "you have not configured your device name yet")
 	// ErrAccountIDNotConfigured is the error returned when the loaded profile is missing the account_id property
-	ErrAccountIDNotConfigured = errors.New("you have not configured your accountID yet")
+	ErrAccountIDNotConfigured = errorcategory.New(errorcategory.UserInput, "you have not configured your accountID yet")
 )
 
 // CallNonEmptyArray calls an argument validator on all non-empty elements of
@@ -53,7 +53,35 @@ func CallNonEmpty(validator ArgValidator, value string) error {
 }
 
 func authError(message string) error {
-	return errorcategory.With(errors.New(message), errorcategory.Auth)
+	return errorcategory.New(errorcategory.Auth, message)
+}
+
+// Length returns an ArgValidator requiring the value's rune length to fall
+// within [minLength, maxLength].
+func Length(minLength, maxLength int) ArgValidator {
+	return func(value string) error {
+		length := utf8.RuneCountInString(value)
+		if length < minLength {
+			return errorcategory.Errorf(errorcategory.UserInput, "must be at least %d characters", minLength)
+		}
+		if length > maxLength {
+			return errorcategory.Errorf(errorcategory.UserInput, "must be at most %d characters", maxLength)
+		}
+
+		return nil
+	}
+}
+
+// OneOf returns an ArgValidator requiring the value to exactly match one of
+// allowed.
+func OneOf(allowed ...string) ArgValidator {
+	return func(value string) error {
+		if slices.Contains(allowed, value) {
+			return nil
+		}
+
+		return errorcategory.Errorf(errorcategory.UserInput, "%q is not one of the allowed values (%s)", value, strings.Join(allowed, ", "))
+	}
 }
 
 // APIKey validates that a string looks like an API key.
@@ -104,7 +132,7 @@ func Account(account string) error {
 		return nil
 	}
 
-	return fmt.Errorf("%s is not an acceptable account filter (CONNECT_IN, CONNECT_OUT, SELF)", account)
+	return errorcategory.Errorf(errorcategory.UserInput, "%s is not an acceptable account filter (CONNECT_IN, CONNECT_OUT, SELF)", account)
 }
 
 // HTTPMethod validates that a string is an acceptable HTTP method.
@@ -115,7 +143,7 @@ func HTTPMethod(method string) error {
 		return nil
 	}
 
-	return fmt.Errorf("%s is not an acceptable HTTP method (GET, POST, DELETE)", method)
+	return errorcategory.Errorf(errorcategory.UserInput, "%s is not an acceptable HTTP method (GET, POST, DELETE)", method)
 }
 
 // RequestSource validates that a string is an acceptable request source.
@@ -126,7 +154,7 @@ func RequestSource(source string) error {
 		return nil
 	}
 
-	return fmt.Errorf("%s is not an acceptable source (API, DASHBOARD)", source)
+	return errorcategory.Errorf(errorcategory.UserInput, "%s is not an acceptable source (API, DASHBOARD)", source)
 }
 
 // RequestStatus validates that a string is an acceptable request status.
@@ -137,7 +165,7 @@ func RequestStatus(status string) error {
 		return nil
 	}
 
-	return fmt.Errorf("%s is not an acceptable request status (SUCCEEDED, FAILED)", status)
+	return errorcategory.Errorf(errorcategory.UserInput, "%s is not an acceptable request status (SUCCEEDED, FAILED)", status)
 }
 
 // StatusCode validates that a provided status code is within the range of
@@ -156,7 +184,7 @@ func StatusCode(code string) error {
 		return nil
 	}
 
-	return fmt.Errorf("provided status code %s is not in the range of acceptable status codes (200's, 400's, 500's)", code)
+	return errorcategory.Errorf(errorcategory.UserInput, "provided status code %s is not in the range of acceptable status codes (200's, 400's, 500's)", code)
 }
 
 // StatusCodeType validates that a provided status code type is one of those
@@ -165,7 +193,7 @@ func StatusCodeType(code string) error {
 	codeUpper := strings.ToUpper(code)
 
 	if codeUpper != "2XX" && codeUpper != "4XX" && codeUpper != "5XX" {
-		return fmt.Errorf("provided status code type %s is not a valid type (2XX, 4XX, 5XX)", code)
+		return errorcategory.Errorf(errorcategory.UserInput, "provided status code type %s is not a valid type (2XX, 4XX, 5XX)", code)
 	}
 
 	return nil
@@ -175,12 +203,12 @@ func StatusCodeType(code string) error {
 func OneDollar(number string) error {
 	num, err := strconv.Atoi(number)
 	if err != nil {
-		return fmt.Errorf("provided amount %v to charge should be an integer (eg. 100)", number)
+		return errorcategory.Errorf(errorcategory.UserInput, "provided amount %v to charge should be an integer (eg. 100)", number)
 	}
 
 	if num >= 100 {
 		return nil
 	}
 
-	return fmt.Errorf("provided amount %v to charge is not at least 100", number)
+	return errorcategory.Errorf(errorcategory.UserInput, "provided amount %v to charge is not at least 100", number)
 }

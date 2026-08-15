@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"os"
 	"strings"
+
+	"github.com/stripe/stripe-cli/pkg/errorcategory"
 )
 
 const reauthPath = accessAPNPath + "/token/reauth"
@@ -22,6 +24,9 @@ type reauthResponse struct {
 func Reauth(ctx context.Context, accessBaseURL, accessToken string) error {
 	reauthURL, err := fetchReauthURL(ctx, accessBaseURL, accessToken)
 	if err != nil {
+		return err
+	}
+	if err := validateBrowserURL(reauthURL, accessBaseURL); err != nil {
 		return err
 	}
 
@@ -45,7 +50,7 @@ func fetchReauthURL(ctx context.Context, accessBaseURL, accessToken string) (str
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := accessSrvHTTPClient.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -63,14 +68,14 @@ func fetchReauthURL(ctx context.Context, accessBaseURL, accessToken string) (str
 			return "", fmt.Errorf("failed to parse reauth response: %w", err)
 		}
 		if r.ReauthURL == "" {
-			return "", fmt.Errorf("reauth response missing reauth_url")
+			return "", errorcategory.Errorf(errorcategory.Auth, "reauth response missing reauth_url")
 		}
 		return r.ReauthURL, nil
 	case http.StatusUnauthorized:
-		return "", fmt.Errorf("session expired or revoked; run 'stripe login' to authenticate again")
+		return "", errorcategory.Errorf(errorcategory.Auth, "session expired or revoked; run 'stripe login' to authenticate again")
 	case http.StatusBadRequest:
-		return "", fmt.Errorf("invalid reauth request (invalid_request); check your configuration")
+		return "", errorcategory.Errorf(errorcategory.Auth, "invalid reauth request (invalid_request); check your configuration")
 	default:
-		return "", fmt.Errorf("reauth request failed (status %d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return "", errorcategory.Errorf(errorcategory.Auth, "reauth request failed (status %d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 }

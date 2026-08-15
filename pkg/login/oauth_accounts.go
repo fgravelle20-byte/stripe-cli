@@ -10,6 +10,7 @@ import (
 
 	"github.com/stripe/stripe-cli/pkg/ansi"
 	"github.com/stripe/stripe-cli/pkg/config"
+	"github.com/stripe/stripe-cli/pkg/errorcategory"
 )
 
 type listAccountsResponse struct {
@@ -17,15 +18,8 @@ type listAccountsResponse struct {
 }
 
 // ListAuthorizedAccounts returns the Stripe accounts accessible to accessToken.
-// If the endpoint is unreachable or returns a non-200 response, it falls back
-// to stub data so that callers can be built and tested before the endpoint is live.
-// TODO: remove stub fallback once GET /stripecli/oauth2/token/accounts is available.
 func ListAuthorizedAccounts(ctx context.Context, accessBaseURL, accessToken string) ([]config.AuthorizedAccount, error) {
-	accounts, err := fetchAuthorizedAccounts(ctx, accessBaseURL, accessToken)
-	if err != nil {
-		return nil, err
-	}
-	return accounts, nil
+	return fetchAuthorizedAccounts(ctx, accessBaseURL, accessToken)
 }
 
 func fetchAuthorizedAccounts(ctx context.Context, accessBaseURL, accessToken string) ([]config.AuthorizedAccount, error) {
@@ -36,7 +30,7 @@ func fetchAuthorizedAccounts(ctx context.Context, accessBaseURL, accessToken str
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := accessSrvHTTPClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -48,7 +42,7 @@ func fetchAuthorizedAccounts(ctx context.Context, accessBaseURL, accessToken str
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("accounts request failed (status %d): %s", resp.StatusCode, string(body))
+		return nil, errorcategory.Errorf(errorcategory.Auth, "accounts request failed (status %d): %s", resp.StatusCode, string(body))
 	}
 
 	var result listAccountsResponse
@@ -141,7 +135,7 @@ func pickActiveContext(accounts []config.AuthorizedAccount) (accountID string, l
 // profile with the active account's display info.
 func populateProfileFromAccounts(cfg *config.Config, accounts []config.AuthorizedAccount, activeID string, activeLivemode bool) error {
 	if len(accounts) == 0 {
-		return fmt.Errorf("no authorized accounts returned")
+		return errorcategory.Errorf(errorcategory.Auth, "no authorized accounts returned")
 	}
 
 	if err := config.SaveActiveContext(activeID, activeLivemode); err != nil {

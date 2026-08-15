@@ -9,10 +9,18 @@ import (
 	"golang.org/x/term"
 
 	"github.com/stripe/stripe-cli/pkg/config"
+	"github.com/stripe/stripe-cli/pkg/errorcategory"
 	"github.com/stripe/stripe-cli/pkg/login"
 	"github.com/stripe/stripe-cli/pkg/stripe"
 	"github.com/stripe/stripe-cli/pkg/useragent"
 	"github.com/stripe/stripe-cli/pkg/validators"
+)
+
+// revokeToken and initiateLogin are package variables so tests can stub out
+// the network calls made by runLoginCmd.
+var (
+	revokeToken   = login.RevokeToken
+	initiateLogin = login.InitiateLogin
 )
 
 type loginCmd struct {
@@ -142,6 +150,9 @@ func (lc *loginCmd) runLoginCmd(cmd *cobra.Command, args []string) error {
 	if err := stripe.ValidateDashboardBaseURL(lc.dashboardBaseURL); err != nil {
 		return err
 	}
+	if err := login.ValidateAccessBaseURL(lc.accessBaseURL); err != nil {
+		return err
+	}
 
 	if lc.completeDevice {
 		return login.PollPendingDeviceAuth(cmd.Context(), &Config)
@@ -151,8 +162,8 @@ func (lc *loginCmd) runLoginCmd(cmd *cobra.Command, args []string) error {
 		return login.PollForLogin(cmd.Context(), lc.completeURL, &Config)
 	}
 
+	uat, _ := Config.Profile.GetUAT()
 	if !lc.newSession {
-		uat, _ := Config.Profile.GetUAT()
 		if strings.HasPrefix(uat, "oak_") {
 			identity := Config.Profile.GetDisplayName()
 			if identity == "" {
@@ -169,13 +180,18 @@ func (lc *loginCmd) runLoginCmd(cmd *cobra.Command, args []string) error {
 			fmt.Fprintln(cmd.OutOrStdout(), "To log in as a different user, run: stripe login --new-session")
 			return nil
 		}
+	} else if strings.HasPrefix(uat, "oak_") {
+		// Revoke the previous OAuth session before starting a new one, same as `stripe logout`.
+		if err := revokeToken(cmd.Context(), lc.accessBaseURL); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: token revocation failed: %s\n", err)
+		}
 	}
 
 	if lc.nonInteractive || !shouldAutoLogin(os.Getenv, term.IsTerminal(int(os.Stdin.Fd()))) {
 		if useragent.DetectAIAgent(os.Getenv) != "" {
 			fmt.Fprintln(os.Stderr, "If you do not have an account, run `stripe sandbox create` instead (provisions a claimable sandbox without a browser).")
 		}
-		return login.InitiateLogin(cmd.Context(), lc.dashboardBaseURL, lc.accessBaseURL, &Config)
+		return initiateLogin(cmd.Context(), lc.dashboardBaseURL, lc.accessBaseURL, &Config)
 	}
 
 	if lc.interactive {
@@ -189,6 +205,9 @@ func (lc *loginCmd) runLoginCmd(cmd *cobra.Command, args []string) error {
 func (lc *loginListCmd) listLoggedInAccountsCmd(cmd *cobra.Command, args []string) error {
 	uat, _ := Config.Profile.GetUAT()
 	if strings.HasPrefix(uat, "oak_") {
+		if err := login.ValidateAccessBaseURL(lc.accessBaseURL); err != nil {
+			return err
+		}
 		return login.PrintAuthorizedContexts(cmd.Context(), lc.accessBaseURL, uat)
 	}
 	return Config.ListProfiles()
@@ -197,6 +216,9 @@ func (lc *loginListCmd) listLoggedInAccountsCmd(cmd *cobra.Command, args []strin
 func (lc *loginSwitchCmd) switchLoggedInAccountCmd(cmd *cobra.Command, args []string) error {
 	uat, _ := Config.Profile.GetUAT()
 	if strings.HasPrefix(uat, "oak_") {
+		if err := login.ValidateAccessBaseURL(lc.accessBaseURL); err != nil {
+			return err
+		}
 		accountID := ""
 		if len(args) > 0 {
 			accountID = args[0]
@@ -204,7 +226,7 @@ func (lc *loginSwitchCmd) switchLoggedInAccountCmd(cmd *cobra.Command, args []st
 		return login.SwitchContext(cmd.Context(), lc.accessBaseURL, &Config, accountID, lc.livemode)
 	}
 	if len(args) == 0 {
-		return fmt.Errorf("account name required")
+		return errorcategory.Errorf(errorcategory.UserInput, "account name required")
 	}
 	return Config.SwitchProfile(args[0])
 }
