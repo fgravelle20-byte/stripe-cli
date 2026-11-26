@@ -18,6 +18,28 @@ The Stripe CLI helps you build, test, and manage your Stripe integration right f
 
 Stripe CLI is available for macOS, Windows, and Linux for distros like Ubuntu, Debian, RedHat and CentOS.
 
+### Installation script (recommended)
+
+Use the installation script for your operating system to enable automatic updates by default.
+
+**macOS or Linux:**
+
+```sh
+curl -fsSL https://cli.stripe.com/install.sh | sh
+```
+
+**Windows (PowerShell):**
+
+```powershell
+irm https://cli.stripe.com/install.ps1 | iex
+```
+
+After installation, open a new terminal to use `stripe`.
+
+### Package managers
+
+Package-manager installations don't support automatic updates. Use your package manager to upgrade the CLI, as described in [Upgrading](#upgrading).
+
 ### npm (macOS, Linux, Windows)
 
 If you have Node.js >= 18 installed, you can install via `npm`:
@@ -163,6 +185,16 @@ Unzip `stripe_X.X.X_windows_x86_64.zip` and add the path containing `stripe.exe`
 
 ## Upgrading
 
+### Automatic updates
+
+When you install using a script, the CLI checks for updates as you use it and automatically installs updates within the same major version.
+
+To disable automatic updates, set `STRIPE_NO_AUTO_UPDATE=1` or add `auto_update = false` to `~/.config/stripe/config.toml`.
+
+### Manual upgrades
+
+If you installed using a package manager, use the matching upgrade command.
+
 ### npm (macOS, Linux, Windows)
 
 ```sh
@@ -216,6 +248,76 @@ Because Docker containers are ephemeral, the `stripe login` command isn't suppor
 
 Download the latest release for your platform from the [GitHub Releases page](https://github.com/stripe/stripe-cli/releases/latest) and replace your existing binary.
 
+## Uninstalling
+
+### 1. Remove your plugins
+
+Package managers only remove the `stripe` binary; they leave installed plugins behind. Remove plugins first, while the `stripe` binary is still available:
+
+```sh
+stripe plugin uninstall --all
+```
+
+### 2. Remove the CLI
+
+**npm (macOS, Linux, Windows):**
+
+```sh
+npm uninstall -g @stripe/cli
+```
+
+**Homebrew (macOS):**
+
+```sh
+brew uninstall stripe
+```
+
+**apt (Debian, Ubuntu):**
+
+```sh
+sudo apt remove stripe
+```
+
+**yum/dnf (RedHat, Fedora, CentOS):**
+
+```sh
+sudo yum remove stripe
+```
+
+**WinGet (Windows):**
+
+```sh
+winget uninstall Stripe.StripeCLI
+```
+
+**Scoop (Windows):**
+
+```sh
+scoop uninstall stripe
+```
+
+**Docker:**
+
+```sh
+docker rmi stripe/stripe-cli
+```
+
+**Without package managers:**
+
+Delete the `stripe` binary you downloaded.
+
+### 3. Optionally remove configuration and credentials
+
+Uninstalling the CLI intentionally keeps your configuration, so reinstalling preserves your projects and settings. It is only removed if you remove it yourself:
+
+```sh
+# Clear stored credentials for every project you are logged into
+stripe logout --all
+
+# Remove all remaining CLI configuration
+rm -rf "${XDG_CONFIG_HOME:-$HOME/.config}/stripe"
+```
+
 ## Usage
 
 Installing the CLI provides access to the `stripe` command.
@@ -235,9 +337,6 @@ The Stripe CLI supports a broad range of commands. Below are some of the most us
 - [`trigger`](https://stripe.com/docs/cli/trigger)
 - [`logs tail`](https://stripe.com/docs/cli/logs/tail)
 - [`events resend`](https://stripe.com/docs/cli/events/resend)
-- [`samples`](https://stripe.com/docs/cli/intro_stripe_samples)
-- [`serve`](https://stripe.com/docs/cli/serve)
-- [`status`](https://stripe.com/docs/cli/status)
 - [`config`](https://stripe.com/docs/cli/config)
 - [`open`](https://stripe.com/docs/cli/open)
 - [`get`, `post` & `delete` commands](https://stripe.com/docs/cli/get)

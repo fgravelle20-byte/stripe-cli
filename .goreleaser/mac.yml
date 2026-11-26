@@ -39,11 +39,11 @@ archives:
     files:
       - none*
 changelog:
-  sort: asc
-  filters:
-    exclude:
-      - "^docs:"
-      - "^test:"
+  # Only a fallback. The release workflow passes --release-notes, which makes
+  # GoReleaser publish that file and skip changelog generation entirely. Do not
+  # set `disable: true` here: that skips the pipe that reads --release-notes and
+  # publishes an empty body.
+  use: github-native
 notarize:
   macos:
     - enabled: '{{ isEnvSet "MACOS_SIGN_P12" }}'
@@ -61,6 +61,10 @@ notarize:
         timeout: 20m
 checksum:
   name_template: "{{ .ProjectName }}-mac-checksums.txt"
+signs:
+  - cmd: go
+    args: ["run", "./scripts/sign-release-checksums", "${artifact}", "${signature}"]
+    artifacts: checksum
 release:
   replace_existing_artifacts: true
 snapshot:
@@ -92,4 +96,9 @@ brews:
           if [[ -f $e ]]; then source $e; fi
         }
       EOS
-    caveats: "❤ Thanks for installing the Stripe CLI! If this is your first time using the CLI, be sure to run `stripe login` first."
+    caveats: |-
+      ❤ Thanks for installing the Stripe CLI! If this is your first time using the CLI, be sure to run `stripe login` first.
+
+      Uninstalling: Homebrew preserves your Stripe CLI plugins and configuration when it
+      removes the stripe binary. To remove plugins too, run `stripe plugin uninstall --all`
+      before `brew uninstall stripe`, while the stripe binary is still available.

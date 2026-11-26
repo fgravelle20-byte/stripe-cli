@@ -19,14 +19,21 @@ func init() {
 }
 
 // refreshOAuthToken exchanges the stored refresh token for a new access token
-// and updates p in-place. On invalid_grant it clears all OAuth credentials so
-// the next ResolveCredentials call surfaces an actionable re-login error.
+// and updates p in-place. On invalid_grant or invalid_scope — the latter
+// happens when the active account/mode was deauthorized, so the server won't
+// reissue a token scoped to it — it clears all OAuth credentials so the next
+// ResolveCredentials call surfaces an actionable re-login error. Credentials
+// have to go in both cases: without a usable access token, nothing else
+// (including 'stripe switch', which itself needs a valid token to list
+// accounts) can recover the session, so 'stripe login' is the only way
+// forward; it already falls back to a fresh device-auth flow whenever the
+// existing session can't be revived (see sessionIsValid in cmd/login.go).
 func refreshOAuthToken(p *config.Profile) error {
 	if config.KeyRing == nil {
 		return errorcategory.New(errorcategory.Auth, "keyring unavailable; run 'stripe login' to re-authenticate")
 	}
 
-	refreshTokenBytes, err := config.KeyRing.Get(config.OAuthRefreshTokenKeychainKey)
+	refreshTokenBytes, err := config.KeyRing.Get(p.KeyringKey(config.OAuthRefreshTokenKeychainKey))
 	if err != nil {
 		if errors.Is(err, keyring.ErrKeyNotFound) {
 			return errorcategory.New(errorcategory.Auth, "session expired; run 'stripe login' to re-authenticate")
@@ -43,10 +50,11 @@ func refreshOAuthToken(p *config.Profile) error {
 	tokenResp, err := doRefreshToken(context.Background(), accessBaseURL, clientID, string(refreshTokenBytes))
 	if err != nil {
 		var oauthErr *OAuthError
-		if errors.As(err, &oauthErr) && oauthErr.Code == "invalid_grant" {
-			// Token is invalid or consumed; clear credentials so the user gets a
-			// clear "run stripe login" error on the next attempt rather than an
-			// opaque 401 from the Stripe API.
+		if errors.As(err, &oauthErr) && (oauthErr.Code == "invalid_grant" || oauthErr.Code == "invalid_scope") {
+			// Token is invalid, consumed, or no longer covers an authorized
+			// scope; clear credentials so the user gets a clear "run stripe
+			// login" error on the next attempt rather than an opaque 401 from
+			// the Stripe API.
 			_ = clearOAuthCredentialsForProfile(p)
 			return errorcategory.New(errorcategory.Auth, "session expired; run 'stripe login' to re-authenticate")
 		}
@@ -54,29 +62,56 @@ func refreshOAuthToken(p *config.Profile) error {
 	}
 
 	p.UAT = tokenResp.AccessToken
+	preserveProfileMetadata(p)
 	if err := p.CreateProfile(); err != nil {
 		return err
 	}
 
 	if tokenResp.RefreshToken != "" {
-		if err := config.KeyRing.Set(config.OAuthRefreshTokenKeychainKey, []byte(tokenResp.RefreshToken), "Stripe CLI OAuth refresh token"); err != nil {
+		if err := config.KeyRing.Set(p.KeyringKey(config.OAuthRefreshTokenKeychainKey), []byte(tokenResp.RefreshToken), "Stripe CLI refresh token"); err != nil {
 			return err
 		}
 	} else {
 		// Per spec: no refresh token in response means the submitted token was
 		// consumed and no replacement was issued. Remove it so the next expiry
 		// triggers a re-login rather than another invalid_grant attempt.
-		_ = config.KeyRing.Remove(config.OAuthRefreshTokenKeychainKey)
+		_ = config.KeyRing.Remove(p.KeyringKey(config.OAuthRefreshTokenKeychainKey))
 	}
 
 	if tokenResp.ExpiresIn > 0 {
 		expiresAt := time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second)
-		if err := config.SaveUATExpiresAt(expiresAt); err != nil {
+		if err := p.SaveUATExpiresAt(expiresAt); err != nil {
 			return err
 		}
 	}
 
 	return nil
+}
+
+// preserveProfileMetadata carries forward the display name, account ID, user
+// ID, and device name already persisted for this profile. CreateProfile
+// deletes those fields before rewriting them from p, so unless they're
+// populated here first, a refresh (which only knows the new UAT) would wipe
+// them from the config file.
+func preserveProfileMetadata(p *config.Profile) {
+	if p.DisplayName == "" {
+		p.DisplayName = p.GetDisplayName()
+	}
+	if p.AccountID == "" {
+		if accountID, err := p.GetAccountID(); err == nil {
+			p.AccountID = accountID
+		}
+	}
+	if p.UserID == "" {
+		if userID, err := p.GetUserID(); err == nil {
+			p.UserID = userID
+		}
+	}
+	if p.DeviceName == "" {
+		if deviceName, err := p.GetDeviceName(); err == nil {
+			p.DeviceName = deviceName
+		}
+	}
 }
 
 // doRefreshToken calls the token endpoint with grant_type=refresh_token.

@@ -94,7 +94,7 @@ func APIKey(input string) error {
 
 	keyParts := strings.Split(input, "_")
 	if len(keyParts) < 3 {
-		return authError("you are using a legacy-style API key which is unsupported by the CLI. Please generate a new test mode API key")
+		return authError("You are using a legacy-style API key, which is unsupported by the CLI. Please generate a new test API key")
 	}
 
 	if keyParts[0] != "sk" && keyParts[0] != "rk" && keyParts[0] != "rkcs" {
@@ -114,7 +114,7 @@ func APIKeyNotRestricted(input string) error {
 
 	keyParts := strings.Split(input, "_")
 	if len(keyParts) < 3 {
-		return authError("you are using a legacy-style API key which is unsupported by the CLI. Please generate a new test mode API key")
+		return authError("You are using a legacy-style API key, which is unsupported by the CLI. Please generate a new test API key")
 	}
 
 	if keyParts[0] != "sk" || keyParts[0] == "rk" {
@@ -197,18 +197,4 @@ func StatusCodeType(code string) error {
 	}
 
 	return nil
-}
-
-// OneDollar validates that a provided number is at least 100 (ie. 1 dollar)
-func OneDollar(number string) error {
-	num, err := strconv.Atoi(number)
-	if err != nil {
-		return errorcategory.Errorf(errorcategory.UserInput, "provided amount %v to charge should be an integer (eg. 100)", number)
-	}
-
-	if num >= 100 {
-		return nil
-	}
-
-	return errorcategory.Errorf(errorcategory.UserInput, "provided amount %v to charge is not at least 100", number)
 }

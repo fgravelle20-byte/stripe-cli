@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"strings"
@@ -14,15 +15,17 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/afero"
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 
 	"github.com/stripe/stripe-cli/pkg/ansi"
+	"github.com/stripe/stripe-cli/pkg/cmd/internal/pluginlogin"
 	"github.com/stripe/stripe-cli/pkg/cmd/plugin/postinstall"
 	"github.com/stripe/stripe-cli/pkg/config"
-	"github.com/stripe/stripe-cli/pkg/errorcategory"
 	"github.com/stripe/stripe-cli/pkg/login"
 	"github.com/stripe/stripe-cli/pkg/plugins"
 	"github.com/stripe/stripe-cli/pkg/stripe"
 	"github.com/stripe/stripe-cli/pkg/validators"
+	"github.com/stripe/stripe-cli/pkg/version"
 )
 
 // InstallCmd is the struct used for configuring the plugin install command
@@ -34,6 +37,9 @@ type InstallCmd struct {
 	apiBaseURL       string
 	dashboardBaseURL string
 	accessBaseURL    string
+	stdinIsTerminal  func() bool
+	lookupEnvFn      func(string) string
+	loginFn          func(context.Context) error
 }
 
 // NewInstallCmd creates a command for installing plugins
@@ -41,6 +47,11 @@ func NewInstallCmd(config *config.Config) *InstallCmd {
 	ic := &InstallCmd{}
 	ic.fs = afero.NewOsFs()
 	ic.cfg = config
+	ic.stdinIsTerminal = func() bool { return term.IsTerminal(int(os.Stdin.Fd())) }
+	ic.lookupEnvFn = os.Getenv
+	ic.loginFn = func(ctx context.Context) error {
+		return login.Login(ctx, resolveDashboardBaseURL(ic.apiBaseURL, ic.dashboardBaseURL), ic.accessBaseURL, ic.apiBaseURL, ic.cfg)
+	}
 
 	ic.Cmd = &cobra.Command{
 		Use:   "install <plugin>",
@@ -84,6 +95,17 @@ func resolveDashboardBaseURL(apiBaseURL, dashboardBaseURL string) string {
 	return stripe.DashboardBaseURLForAPIBaseURL(apiBaseURL)
 }
 
+// explicitFlagValue returns value if the named flag was explicitly set by the user, or "" if
+// it was left at its default. This is used to decide what to forward to a plugin via
+// AdditionalInfo: a plugin should only hear about a base URL override the user actually chose,
+// not the CLI's own resolved default.
+func explicitFlagValue(cmd *cobra.Command, name, value string) string {
+	if cmd.Flags().Changed(name) {
+		return value
+	}
+	return ""
+}
+
 func (ic *InstallCmd) runInstallCmd(cmd *cobra.Command, args []string) error {
 	if err := stripe.ValidateAPIBaseURL(ic.apiBaseURL); err != nil {
 		return err
@@ -102,45 +124,17 @@ func (ic *InstallCmd) runInstallCmd(cmd *cobra.Command, args []string) error {
 	isLatest := len(version) == 0
 	resolvedPlugin, err := plugins.ResolvePluginForInstall(cmd.Context(), ic.cfg, ic.fs, pluginName, version, ic.apiBaseURL, dashboardBaseURL)
 	if err != nil {
-		var pluginNotFound *plugins.ErrPluginNotFound
-		if errors.As(err, &pluginNotFound) {
-			accountID, aErr := ic.cfg.GetProfile().GetAccountID()
-			if aErr != nil || accountID == "" {
-				fmt.Printf("No plugin named %q found. If this is a private plugin, you must be logged in to install it.\n\n", pluginName)
-				fmt.Print("Press Enter to run 'stripe login', or type anything to cancel")
-				var input string
-				fmt.Fscanln(os.Stdin, &input)
-				if input != "" {
-					return errorcategory.Errorf(errorcategory.UserInput, "login canceled")
-				}
-				if lErr := login.Login(cmd.Context(), dashboardBaseURL, ic.accessBaseURL, ic.cfg); lErr != nil {
-					return lErr
-				}
-				resolvedPlugin, err = plugins.ResolvePluginForInstall(cmd.Context(), ic.cfg, ic.fs, pluginName, version, ic.apiBaseURL, dashboardBaseURL)
-				if err != nil {
-					return errorcategory.Errorf(errorcategory.UserInput, "no plugin named %q exists", pluginName)
-				}
-			} else {
-				return errorcategory.Errorf(errorcategory.UserInput, "no plugin named %q exists", pluginName)
-			}
-		} else {
-			accountID, aErr := ic.cfg.GetProfile().GetAccountID()
-			if aErr != nil || accountID == "" {
-				fmt.Printf("You must be logged in to install the \"%s\" plugin.\n\n", pluginName)
-				fmt.Print("Press Enter to run 'stripe login', or type anything to cancel")
-				var input string
-				fmt.Fscanln(os.Stdin, &input)
-				if input != "" {
-					return errorcategory.Errorf(errorcategory.UserInput, "login canceled")
-				}
-				if lErr := login.Login(cmd.Context(), dashboardBaseURL, ic.accessBaseURL, ic.cfg); lErr != nil {
-					return lErr
-				}
-				resolvedPlugin, err = plugins.ResolvePluginForInstall(cmd.Context(), ic.cfg, ic.fs, pluginName, version, ic.apiBaseURL, dashboardBaseURL)
-			}
-			if err != nil {
-				return err
-			}
+		if !errors.Is(err, validators.ErrAPIKeyNotConfigured) {
+			return err
+		}
+		if loginErr := pluginlogin.Offer(pluginName, err, cmd.InOrStdin(), cmd.ErrOrStderr(),
+			pluginlogin.CanPrompt(ic.lookupEnvFn, ic.stdinIsTerminal()),
+			func() error { return ic.loginFn(cmd.Context()) }); loginErr != nil {
+			return loginErr
+		}
+		resolvedPlugin, err = plugins.ResolvePluginForInstall(cmd.Context(), ic.cfg, ic.fs, pluginName, version, ic.apiBaseURL, dashboardBaseURL)
+		if err != nil {
+			return err
 		}
 	}
 	plugin := resolvedPlugin.Plugin
@@ -148,6 +142,9 @@ func (ic *InstallCmd) runInstallCmd(cmd *cobra.Command, args []string) error {
 
 	if plugin.IsVersionInstalled(ic.cfg, ic.fs, version) {
 		if err := plugins.PersistInstalledPluginState(ic.cfg, ic.fs, *plugin); err != nil {
+			return err
+		}
+		if err := plugin.CleanupOtherVersions(ic.cfg, ic.fs, version); err != nil {
 			return err
 		}
 		if isLatest {
@@ -166,15 +163,27 @@ func (ic *InstallCmd) runInstallCmd(cmd *cobra.Command, args []string) error {
 		}).Debug("Ctrl+C received, cleaning up...")
 	})
 
-	if err := resolvedPlugin.Install(ctx, ic.cfg, ic.fs, ic.apiBaseURL, dashboardBaseURL); err != nil {
+	hookBaseURLs := plugins.HookBaseURLs{
+		APIBaseURL:       explicitFlagValue(cmd, "api-base", ic.apiBaseURL),
+		DashboardBaseURL: explicitFlagValue(cmd, "dashboard-base", ic.dashboardBaseURL),
+		AccessBaseURL:    explicitFlagValue(cmd, "access-base", ic.accessBaseURL),
+	}
+
+	if err := resolvedPlugin.Install(ctx, ic.cfg, ic.fs, ic.apiBaseURL, dashboardBaseURL, hookBaseURLs); err != nil {
 		return err
 	}
 
+	runPostInstallHook(ctx, ic.cfg, ic.fs, plugin, version, prevVersion,
+		hookBaseURLs.APIBaseURL, hookBaseURLs.DashboardBaseURL, hookBaseURLs.AccessBaseURL)
+
 	if prevVersion != "" {
-		sendPluginLifecycleEvent(cmd.Context(), "Plugin Upgraded", version)
+		plugins.SendPluginLifecycleEvent(cmd.Context(), plugins.PluginUpgradedEvent, version)
 		fmt.Println(color.Green(fmt.Sprintf("✔ %s from v%s to v%s.", versionChangeVerb(prevVersion, version), prevVersion, version)))
+		if isLatest {
+			printUnrequestedDowngradeNote(os.Stdout, plugin.Shortname, prevVersion, version)
+		}
 	} else {
-		sendPluginLifecycleEvent(cmd.Context(), "Plugin Installed", version)
+		plugins.SendPluginLifecycleEvent(cmd.Context(), plugins.PluginInstalledEvent, version)
 		fmt.Println(color.Green(fmt.Sprintf("✔ installation of v%s complete.", version)))
 	}
 	postinstall.PrintTips(os.Stdout, plugin.Shortname)
@@ -183,12 +192,41 @@ func (ic *InstallCmd) runInstallCmd(cmd *cobra.Command, args []string) error {
 }
 
 func versionChangeVerb(from, to string) string {
-	prev, prevErr := goversion.NewVersion(from)
-	next, nextErr := goversion.NewVersion(to)
-	if prevErr == nil && nextErr == nil && prev.GreaterThan(next) {
+	if isVersionDowngrade(from, to) {
 		return "downgraded"
 	}
 	return "upgraded"
+}
+
+func isVersionDowngrade(from, to string) bool {
+	prev, prevErr := goversion.NewVersion(from)
+	next, nextErr := goversion.NewVersion(to)
+
+	return prevErr == nil && nextErr == nil && prev.GreaterThan(next)
+}
+
+// printUnrequestedDowngradeNote explains a rollback the user did not ask for: they
+// asked for the latest release and got one older than what was already installed.
+// Callers that install a version the user named skip it, since nothing there is
+// surprising.
+//
+// A core CLI that no longer meets a plugin's min_core_version is the reason this
+// happens on its own -- the API withholds the releases this CLI cannot run, so
+// "latest" moves backwards after a CLI downgrade. But the API only sends back the
+// release it chose, not why the newer ones were left out, and a withdrawn release
+// looks identical from here. So this names what the CLI can actually vouch for --
+// the newest release offered to this version of the CLI -- and points at the
+// upgrade without claiming to know it is the fix.
+func printUnrequestedDowngradeNote(w io.Writer, pluginName, prevVersion, newVersion string) {
+	if !isVersionDowngrade(prevVersion, newVersion) {
+		return
+	}
+
+	color := ansi.Color(w)
+	fmt.Fprintln(w, color.Yellow(fmt.Sprintf(
+		"v%s is the newest %s release available to Stripe CLI %s. Newer releases may require a newer Stripe CLI: https://docs.stripe.com/stripe-cli/upgrade",
+		newVersion, pluginName, version.Version,
+	)).String())
 }
 
 func (ic *InstallCmd) setInstallTelemetryMetadata(ctx context.Context, pluginName string) {
@@ -196,18 +234,6 @@ func (ic *InstallCmd) setInstallTelemetryMetadata(ctx context.Context, pluginNam
 	if telemetryMetadata != nil {
 		telemetryMetadata.SetPluginName(pluginName)
 	}
-}
-
-// sendPluginLifecycleEvent sends a telemetry event for a plugin install, upgrade, or uninstall.
-func sendPluginLifecycleEvent(ctx context.Context, eventName, pluginVersion string) {
-	telemetryClient := stripe.GetTelemetryClient(ctx)
-	if telemetryClient == nil {
-		return
-	}
-	if m := stripe.GetEventMetadata(ctx); m != nil {
-		m.SetPluginVersion(pluginVersion)
-	}
-	telemetryClient.SendEvent(ctx, eventName, pluginVersion)
 }
 
 func withSIGTERMCancel(ctx context.Context, onCancel func()) context.Context {

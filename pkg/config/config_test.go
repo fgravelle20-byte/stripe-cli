@@ -2,15 +2,229 @@ package config
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
+	"time"
 
+	log "github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
 	"github.com/stretchr/testify/require"
 
 	"github.com/stripe/stripe-cli/pkg/keyring"
 )
+
+func TestSecureConfigPermissionsSkipsChmodForOwnerOnlyFiles(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permissions")
+	}
+	originalChmod := configFileChmod
+	t.Cleanup(func() { configFileChmod = originalChmod })
+	configFileChmod = func(string, os.FileMode) error {
+		t.Error("owner-only files must not require chmod")
+		return os.ErrPermission
+	}
+
+	for _, mode := range []os.FileMode{0600, 0400, 0200, 0} {
+		path := filepath.Join(t.TempDir(), "config.toml")
+		require.NoError(t, os.WriteFile(path, nil, 0600))
+		require.NoError(t, os.Chmod(path, mode))
+		require.NoError(t, secureConfigPermissions(path))
+	}
+}
+
+func TestInitConfigPermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permissions")
+	}
+	for _, explicit := range []bool{false, true} {
+		for _, scenario := range []string{"safe", "repair", "denied", "inspection denied", "missing"} {
+			name := fmt.Sprintf("explicit=%t/%s", explicit, scenario)
+			t.Run(name, func(t *testing.T) {
+				viper.Reset()
+				t.Cleanup(viper.Reset)
+				t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+				path := filepath.Join(getConfigFolder(os.Getenv("XDG_CONFIG_HOME")), "config.toml")
+				if explicit {
+					path = filepath.Join(t.TempDir(), "selected.toml")
+				}
+				require.NoError(t, os.MkdirAll(filepath.Dir(path), 0700))
+				original := []byte("[default]\ncolor = 'off'\ntest_mode_api_key = 'test-only-placeholder'\n")
+				if scenario != "missing" {
+					require.NoError(t, os.WriteFile(path, original, 0600))
+					if scenario != "safe" {
+						require.NoError(t, os.Chmod(path, 0644))
+					}
+				}
+
+				originalChmod, originalStat := configFileChmod, configFileStat
+				t.Cleanup(func() { configFileChmod, configFileStat = originalChmod, originalStat })
+				chmodCalls := 0
+				configFileChmod = func(path string, mode os.FileMode) error {
+					chmodCalls++
+					if scenario != "repair" {
+						return os.ErrPermission
+					}
+					return originalChmod(path, mode)
+				}
+				if scenario == "inspection denied" {
+					configFileStat = func(string) (os.FileInfo, error) { return nil, os.ErrPermission }
+				}
+
+				var logs bytes.Buffer
+				logger := log.StandardLogger()
+				oldOutput, oldLevel, oldFormatter := logger.Out, logger.GetLevel(), logger.Formatter
+				log.SetOutput(&logs)
+				t.Cleanup(func() {
+					log.SetOutput(oldOutput)
+					log.SetLevel(oldLevel)
+					log.SetFormatter(oldFormatter)
+				})
+				oldKeyRing := KeyRing
+				KeyRing = keyring.NewMemoryStore(nil)
+				t.Cleanup(func() { KeyRing = oldKeyRing })
+				c := &Config{LogLevel: "info", Profile: Profile{ProfileName: "default"}}
+				if explicit {
+					c.ProfilesFile = path
+				}
+				c.InitConfig()
+				c.InitConfig()
+				require.Equal(t, path, c.ProfilesFile)
+				if scenario != "missing" {
+					require.Equal(t, "test-only-placeholder", c.Profile.ReadProfileString(TestModeAPIKeyName))
+				}
+
+				failed := scenario == "denied" || scenario == "inspection denied"
+				if failed {
+					require.Equal(t, 1, strings.Count(logs.String(), "Could not secure config file"))
+					require.Contains(t, logs.String(), path)
+					require.Contains(t, logs.String(), "chmod 600")
+					require.NotContains(t, logs.String(), "test-only-placeholder")
+					// The startup telemetry write is best effort and must not
+					// turn a permission warning into a read-only command failure.
+					require.NotEmpty(t, c.GetMachineUUID())
+					contents, err := os.ReadFile(path)
+					require.NoError(t, err)
+					require.Equal(t, original, contents)
+				} else {
+					require.Empty(t, logs.String())
+				}
+				switch scenario {
+				case "repair":
+					require.Equal(t, 1, chmodCalls)
+					info, err := os.Stat(path)
+					require.NoError(t, err)
+					require.Equal(t, os.FileMode(0600), info.Mode().Perm())
+				case "denied":
+					require.Positive(t, chmodCalls)
+				case "safe":
+					require.NotEmpty(t, c.GetMachineUUID())
+					require.Zero(t, chmodCalls)
+				default:
+					require.Zero(t, chmodCalls)
+				}
+				if scenario == "missing" {
+					_, err := os.Stat(path)
+					require.ErrorIs(t, err, os.ErrNotExist)
+				}
+				if !explicit && scenario == "denied" {
+					// Flag parsing can change the path after eager loading.
+					selected := filepath.Join(t.TempDir(), "selected.toml")
+					require.NoError(t, os.WriteFile(selected, original, 0600))
+					require.NoError(t, os.Chmod(selected, 0644))
+					c.ProfilesFile = selected
+					c.InitConfig()
+					c.InitConfig()
+					require.Equal(t, 2, strings.Count(logs.String(), "Could not secure config file"))
+					require.Contains(t, logs.String(), selected)
+					c.ProfilesFile = path
+					c.InitConfig()
+					require.Equal(t, 2, strings.Count(logs.String(), "Could not secure config file"))
+				}
+			})
+		}
+	}
+}
+
+func TestConfigCredentialWritesRequireSecurePermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permissions")
+	}
+	for _, writer := range []string{"profile", "profile field", "config field"} {
+		for _, denied := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/denied=%t", writer, denied), func(t *testing.T) {
+				c, path, cleanup := setupTestConfig(t)
+				defer cleanup()
+				original := []byte("[default]\ntest_mode_api_key = 'old-test-placeholder'\n")
+				require.NoError(t, os.WriteFile(path, original, 0600))
+				require.NoError(t, os.Chmod(path, 0644))
+				require.NoError(t, viper.ReadInConfig())
+				originalChmod := configFileChmod
+				t.Cleanup(func() { configFileChmod = originalChmod })
+				configFileChmod = func(path string, mode os.FileMode) error {
+					if denied {
+						return os.ErrPermission
+					}
+					return originalChmod(path, mode)
+				}
+
+				var err error
+				switch writer {
+				case "profile":
+					p := Profile{ProfileName: "default", TestModeAPIKey: "new-test-placeholder"}
+					err = p.CreateProfile()
+				case "profile field":
+					err = c.Profile.WriteConfigField(TestModeAPIKeyName, "new-test-placeholder")
+				case "config field":
+					err = c.WriteConfigField("default."+TestModeAPIKeyName, "new-test-placeholder")
+				}
+				if denied {
+					require.ErrorIs(t, err, os.ErrPermission)
+					contents, readErr := os.ReadFile(path)
+					require.NoError(t, readErr)
+					require.Equal(t, original, contents)
+				} else {
+					require.NoError(t, err)
+					info, statErr := os.Stat(path)
+					require.NoError(t, statErr)
+					require.Equal(t, os.FileMode(0600), info.Mode().Perm())
+					require.Equal(t, "new-test-placeholder", c.Profile.ReadProfileString(TestModeAPIKeyName))
+				}
+			})
+		}
+	}
+}
+
+func TestConfigCreationPermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permissions")
+	}
+	for _, writer := range []string{"profile", "scratch", "global"} {
+		t.Run(writer, func(t *testing.T) {
+			c, path, cleanup := setupTestConfig(t)
+			defer cleanup()
+			var err error
+			switch writer {
+			case "profile":
+				p := Profile{ProfileName: "default", TestModeAPIKey: "test-only-placeholder"}
+				err = p.CreateProfile()
+			case "scratch":
+				v := viper.New()
+				v.Set("default.test_mode_api_key", "test-only-placeholder")
+				err = writeConfig(v)
+			case "global":
+				err = c.WriteConfigField("default.test_mode_api_key", "test-only-placeholder")
+			}
+			require.NoError(t, err)
+			info, err := os.Stat(path)
+			require.NoError(t, err)
+			require.Equal(t, os.FileMode(0600), info.Mode().Perm())
+		})
+	}
+}
 
 func TestRemoveKey(t *testing.T) {
 	v := viper.New()
@@ -22,6 +236,42 @@ func TestRemoveKey(t *testing.T) {
 
 	require.EqualValues(t, []string{"stay"}, nv.AllKeys())
 	require.ElementsMatch(t, []string{"stay", "remove"}, v.AllKeys())
+}
+
+// The table name is mixed case on purpose: viper stores it lowercased, and the
+// delete has to find that table rather than drop the whole thing.
+func TestDeleteConfigFieldRemovesOnlyThatField(t *testing.T) {
+	c, profilesFile, cleanup := setupTestConfig(t)
+	defer cleanup()
+
+	pluginKey := PluginConfigKey("appA", PluginConfigUpdatesField)
+	siblingKey := PluginConfigKey("appA", "sibling")
+	globalKey := PluginConfigKey(PluginConfigGlobalScope, PluginConfigUpdatesField)
+	require.NoError(t, c.WriteConfigField(pluginKey, PluginConfigOn))
+	require.NoError(t, c.WriteConfigField(siblingKey, "kept"))
+	require.NoError(t, c.WriteConfigField(globalKey, PluginConfigOff))
+
+	require.NoError(t, c.DeleteConfigField(pluginKey))
+
+	onDisk := viper.New()
+	onDisk.SetConfigFile(profilesFile)
+	require.NoError(t, onDisk.ReadInConfig())
+	require.False(t, onDisk.IsSet(pluginKey))
+	require.Equal(t, "kept", onDisk.GetString(siblingKey))
+	require.Equal(t, PluginConfigOff, onDisk.GetString(globalKey))
+
+	require.False(t, viper.IsSet(pluginKey))
+}
+
+func TestDeleteConfigFieldLeavesAnUnsetFieldAlone(t *testing.T) {
+	c, profilesFile, cleanup := setupTestConfig(t)
+	defer cleanup()
+
+	require.NoError(t, c.DeleteConfigField(PluginConfigKey("apps", PluginConfigUpdatesField)))
+
+	// Nothing to remove means nothing to write, so the file is never created.
+	_, err := os.Stat(profilesFile)
+	require.ErrorIs(t, err, os.ErrNotExist)
 }
 
 func setupTestConfig(t *testing.T) (*Config, string, func()) {
@@ -255,6 +505,299 @@ func TestRemoveProfile(t *testing.T) {
 	c.InitConfig()
 	v = viper.GetViper()
 	require.False(t, v.IsSet("to-remove"))
+}
+
+// setupLegacyDottedProfile writes a config file containing a dotted profile
+// alongside a normal one. Dotted names are no longer accepted for new profiles,
+// but ones written before the ban must stay manageable.
+func setupLegacyDottedProfile(t *testing.T) (*Config, string, func()) {
+	t.Helper()
+
+	profilesFile := filepath.Join(t.TempDir(), "config.toml")
+	contents := "[\"example.project\"]\n" +
+		"display_name = 'Legacy'\n" +
+		"test_mode_api_key = 'sk_test_legacy'\n\n" +
+		"[example]\n" +
+		"display_name = 'Sibling'\n" +
+		"test_mode_api_key = 'sk_test_sibling'\n"
+	require.NoError(t, os.WriteFile(profilesFile, []byte(contents), 0600))
+
+	c := &Config{
+		LogLevel:     "info",
+		ProfilesFile: profilesFile,
+		Profile:      Profile{ProfileName: "example.project"},
+	}
+	KeyRing = keyring.NewMemoryStore(nil)
+	c.InitConfig()
+
+	return c, profilesFile, func() {
+		KeyRing = nil
+		viper.Reset()
+	}
+}
+
+// A dotted profile is read back as a nested table, so the enumeration in
+// RemoveProfile never sees it. It must still be removable by name, and removing
+// it must not take the profile that shares its first segment with it.
+func TestRemoveProfileWithDottedName(t *testing.T) {
+	c, _, cleanup := setupLegacyDottedProfile(t)
+	defer cleanup()
+
+	require.NoError(t, c.RemoveProfile("example.project"))
+
+	c.InitConfig()
+	v := viper.GetViper()
+	require.False(t, v.IsSet("example.project.display_name"))
+	require.Equal(t, "sk_test_sibling", v.GetString("example.test_mode_api_key"))
+}
+
+// `stripe logout --project-name example.project` is the documented way out of a
+// legacy dotted profile, so it has to actually clear the credentials rather than
+// report success and leave them on disk.
+func TestRemoveAuthFieldsWithDottedName(t *testing.T) {
+	c, _, cleanup := setupLegacyDottedProfile(t)
+	defer cleanup()
+
+	require.NoError(t, c.RemoveAuthFields("example.project"))
+
+	c.InitConfig()
+	v := viper.GetViper()
+	require.Empty(t, v.GetString("example.project.test_mode_api_key"))
+	require.Equal(t, "sk_test_sibling", v.GetString("example.test_mode_api_key"))
+}
+
+// storedCredentialKeys lists every keyring entry a profile's credentials can
+// occupy: its OAuth session and its live mode API key.
+func storedCredentialKeys(profileName string) []string {
+	p := &Profile{ProfileName: profileName}
+
+	return []string{
+		p.KeyringKey(UATKeychainItemKey),
+		p.KeyringKey(OAuthRefreshTokenKeychainKey),
+		p.KeyringKey(OAuthActiveContextKeychainKey),
+		p.KeyringKey(OAuthUATExpiresAtKeychainKey),
+		p.GetConfigField(LiveModeAPIKeyName),
+	}
+}
+
+func seedStoredCredentials(t *testing.T, profileNames ...string) {
+	t.Helper()
+
+	for _, profileName := range profileNames {
+		for _, key := range storedCredentialKeys(profileName) {
+			require.NoError(t, KeyRing.Set(key, []byte("oak_test_"+profileName), ""))
+		}
+	}
+}
+
+func requireNoStoredCredentials(t *testing.T, profileNames ...string) {
+	t.Helper()
+
+	for _, profileName := range profileNames {
+		for _, key := range storedCredentialKeys(profileName) {
+			_, err := KeyRing.Get(key)
+			require.ErrorIs(t, err, keyring.ErrKeyNotFound, "%s should have been removed from the keyring", key)
+		}
+	}
+}
+
+// `stripe logout --all` promises to clear every project, so it has to reach the
+// profiles the enumeration behind `stripe config --list` cannot see. Each case
+// is run from an unrelated profile, so that nothing is cleared merely by being
+// the current one.
+func TestRemoveAllAuthFieldsClearsProfilesHiddenFromEnumeration(t *testing.T) {
+	tests := []struct {
+		name        string
+		contents    string
+		profileName string
+	}{
+		{
+			name: "period in the name",
+			contents: `["example.project"]
+  display_name = 'Legacy'
+  test_mode_api_key = 'sk_test_hidden'
+`,
+			profileName: "example.project",
+		},
+		{
+			name: "several periods in the name",
+			contents: `["example.project.staging"]
+  display_name = 'Legacy'
+  test_mode_api_key = 'sk_test_hidden'
+`,
+			profileName: "example.project.staging",
+		},
+		{
+			name: "period in the name, sharing a first segment with another profile",
+			contents: `[example]
+  display_name = 'Sibling'
+
+["example.project"]
+  display_name = 'Legacy'
+  test_mode_api_key = 'sk_test_hidden'
+`,
+			profileName: "example.project",
+		},
+		{
+			name: "period in the name, in the v2 layout",
+			contents: `config_version = 2
+
+[profiles."example.project"]
+  display_name = 'Legacy'
+  test_mode_api_key = 'sk_test_hidden'
+`,
+			profileName: "example.project",
+		},
+		{
+			name: "no display_name",
+			contents: `[partial]
+  test_mode_api_key = 'sk_test_hidden'
+`,
+			profileName: "partial",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, profilesFile := setupProfileConfig(t, tt.contents)
+			c.Profile.ProfileName = "normal"
+			seedStoredCredentials(t, tt.profileName)
+
+			require.NoError(t, c.RemoveAllAuthFields())
+
+			requireNoStoredCredentials(t, tt.profileName)
+
+			written, err := os.ReadFile(profilesFile)
+			require.NoError(t, err)
+			require.NotContains(t, string(written), "sk_test_hidden")
+
+			hidden := &Profile{ProfileName: tt.profileName}
+			require.Empty(t, hidden.ReadProfileString(DisplayNameName))
+		})
+	}
+}
+
+// The wider enumeration walks into every table, so it must leave alone the ones
+// that are not credentials: machine-wide settings, and a profile's own settings.
+func TestRemoveAllAuthFieldsPreservesNonAuthSettings(t *testing.T) {
+	c, _ := setupProfileConfig(t, `installed_plugins = ['apps']
+
+[plugin_configs.apps]
+  account_id = 'not a profile field'
+  updates = 'off'
+
+[default]
+  color = 'on'
+  display_name = 'Default'
+
+[default.docs_prefs]
+  format = 'markdown'
+
+["example.project"]
+  color = 'off'
+  display_name = 'Legacy'
+`)
+	c.Profile.ProfileName = "default"
+
+	require.NoError(t, c.RemoveAllAuthFields())
+
+	require.False(t, viper.IsSet("default.display_name"))
+	require.False(t, viper.IsSet("example.project.display_name"))
+
+	require.Equal(t, "on", viper.GetString("default.color"))
+	require.Equal(t, "markdown", viper.GetString("default.docs_prefs.format"))
+	require.Equal(t, "off", viper.GetString("example.project.color"))
+	require.Equal(t, []string{"apps"}, viper.GetStringSlice("installed_plugins"))
+	require.Equal(t, "off", viper.GetString("plugin_configs.apps.updates"))
+	require.Equal(t, "not a profile field", viper.GetString("plugin_configs.apps.account_id"))
+}
+
+// The current profile's keyring entries are keyed by the name the user passed,
+// which need not have a table in the config file for the enumeration to find.
+func TestRemoveAllAuthFieldsClearsCurrentProfileWithoutConfigEntry(t *testing.T) {
+	c, _, cleanup := setupTestConfig(t)
+	defer cleanup()
+
+	c.Profile.ProfileName = "work"
+	seedStoredCredentials(t, "work", "default")
+
+	require.NoError(t, c.RemoveAllAuthFields())
+
+	requireNoStoredCredentials(t, "work", "default")
+}
+
+// `stripe config --remove-profile` reports that it cleared the profile's stored
+// credentials. Once the table is gone nothing can enumerate the profile again,
+// so an OAuth session left behind here would outlive `stripe logout --all` too.
+func TestRemoveProfileClearsOAuthSession(t *testing.T) {
+	for _, profileName := range []string{"work", "example.project"} {
+		t.Run(profileName, func(t *testing.T) {
+			c, _ := setupProfileConfig(t, `["`+profileName+`"]
+  display_name = 'To Remove'
+`)
+			seedStoredCredentials(t, profileName, "personal")
+
+			require.NoError(t, c.RemoveProfile(profileName))
+
+			requireNoStoredCredentials(t, profileName)
+
+			personal := &Profile{ProfileName: "personal"}
+			_, err := KeyRing.Get(personal.KeyringKey(UATKeychainItemKey))
+			require.NoError(t, err, "another profile's session should be left alone")
+		})
+	}
+}
+
+// TestRemoveAuthFieldsClearsOAuthSessionWithoutConfigEntry guards against a
+// regression where OAuth session keyring keys were only cleared when the
+// profile had a matching entry in the config file. A profile can have OAuth
+// session state (UAT, active context, etc.) in the keyring without ever
+// having been written to the config file, so the keyring keys must be
+// cleared unconditionally by profile name.
+func TestRemoveAuthFieldsClearsOAuthSessionWithoutConfigEntry(t *testing.T) {
+	c, _, cleanup := setupTestConfig(t)
+	defer cleanup()
+
+	p := &Profile{ProfileName: "default"}
+	require.NoError(t, KeyRing.Set(p.KeyringKey(UATKeychainItemKey), []byte("oak_test"), ""))
+	require.NoError(t, p.SaveActiveContext("acct_123", true))
+	require.NoError(t, p.SaveUATExpiresAt(time.Now().Add(time.Hour)))
+
+	require.NoError(t, c.RemoveAuthFields("default"))
+
+	_, err := KeyRing.Get(p.KeyringKey(UATKeychainItemKey))
+	require.Error(t, err)
+	ac, err := p.GetActiveContext()
+	require.NoError(t, err)
+	require.Nil(t, ac)
+	_, err = p.GetUATExpiresAt()
+	require.Error(t, err)
+}
+
+// TestRemoveAuthFieldsDoesNotDisturbOtherProfilesOAuthSession verifies that
+// logging out of one profile leaves another profile's independent OAuth
+// session (UAT, active context) intact.
+func TestRemoveAuthFieldsDoesNotDisturbOtherProfilesOAuthSession(t *testing.T) {
+	c, _, cleanup := setupTestConfig(t)
+	defer cleanup()
+
+	work := Profile{ProfileName: "work", DisplayName: "Work", AccountID: "acct_work"}
+	require.NoError(t, work.CreateProfile())
+	personal := Profile{ProfileName: "personal", DisplayName: "Personal", AccountID: "acct_personal"}
+	require.NoError(t, personal.CreateProfile())
+
+	require.NoError(t, work.SaveActiveContext("acct_work", true))
+	require.NoError(t, personal.SaveActiveContext("acct_personal", false))
+
+	require.NoError(t, c.RemoveAuthFields("work"))
+
+	workCtx, err := work.GetActiveContext()
+	require.NoError(t, err)
+	require.Nil(t, workCtx, "work's active context should be cleared")
+
+	personalCtx, err := personal.GetActiveContext()
+	require.NoError(t, err)
+	require.Equal(t, "acct_personal", personalCtx.AccountID)
 }
 
 func TestSwitchProfile(t *testing.T) {

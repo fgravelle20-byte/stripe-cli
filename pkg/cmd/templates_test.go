@@ -18,7 +18,7 @@ func TestGetLogin(t *testing.T) {
 	fs := afero.NewMemMapFs()
 	cfg := config.Config{}
 	expected := `
-Before using the CLI, you'll need to login:
+Before using the CLI, you'll need to log in:
 
   $ stripe login
 
@@ -50,10 +50,7 @@ func TestIsAIAgent_Detected(t *testing.T) {
 }
 
 func TestIsAIAgent_NotDetected(t *testing.T) {
-	// Ensure none of the agent env vars are set
-	for _, key := range []string{"ANTIGRAVITY_CLI_ALIAS", "CLAUDECODE", "CLINE_ACTIVE", "CODEX_INTERNAL_ORIGINATOR_OVERRIDE", "CODEX_SANDBOX", "CODEX_THREAD_ID", "CODEX_SANDBOX_NETWORK_DISABLED", "CODEX_CI", "CURSOR_AGENT", "GEMINI_CLI", "OPENCODE"} {
-		t.Setenv(key, "")
-	}
+	clearAgentEnv(t)
 	assert.False(t, isAIAgent())
 }
 
@@ -62,11 +59,13 @@ func TestFormatAgentGuidance(t *testing.T) {
 	output := formatAgentGuidance(cmd)
 	require.NotEmpty(t, output)
 	assert.Contains(t, output, "[Agent guidance]")
-	assert.Contains(t, output, "stripe sandbox create")
+	assert.Contains(t, output, "stripe sandboxes create")
 	assert.Contains(t, output, "--api-key")
 	assert.Contains(t, output, "STRIPE_API_KEY")
 	assert.Contains(t, output, "stripe --map")
 	assert.Contains(t, output, "stripe resources")
+	assert.Contains(t, output, "--parent[child]=value")
+	assert.Contains(t, output, "--parent.child=value")
 	assert.NotContains(t, output, "--stripe-account", "should not show --stripe-account when flag is not defined")
 	assert.NotContains(t, output, "-d", "should not show -d when data flag is not defined")
 }
@@ -138,9 +137,7 @@ func TestAIAgentHelp_SubcommandOnly(t *testing.T) {
 }
 
 func TestAIAgentHelp_NotDetected(t *testing.T) {
-	for _, key := range []string{"ANTIGRAVITY_CLI_ALIAS", "CLAUDECODE", "CLINE_ACTIVE", "CODEX_INTERNAL_ORIGINATOR_OVERRIDE", "CODEX_SANDBOX", "CODEX_THREAD_ID", "CODEX_SANDBOX_NETWORK_DISABLED", "CODEX_CI", "CURSOR_AGENT", "GEMINI_CLI", "OPENCODE"} {
-		t.Setenv(key, "")
-	}
+	clearAgentEnv(t)
 
 	root := &cobra.Command{Use: "stripe"}
 	child := &cobra.Command{Use: "listen"}
@@ -148,6 +145,16 @@ func TestAIAgentHelp_NotDetected(t *testing.T) {
 
 	assert.Empty(t, aiAgentHelpTop(root))
 	assert.Empty(t, aiAgentHelp(child))
+}
+
+func TestWrappedRequestParamsFlagUsages_BooleanValues(t *testing.T) {
+	cmd := &cobra.Command{Use: "test"}
+	cmd.Flags().Bool("disabled", false, "Disable the endpoint")
+	cmd.Flags().Lookup("disabled").Annotations = map[string][]string{
+		"request": {"true"},
+		"apitype": {"boolean"},
+	}
+	require.Contains(t, WrappedRequestParamsFlagUsages(cmd), "--disabled[=true|false]")
 }
 
 func TestWrappedRequestParamsFlagUsages_FormatAnnotation(t *testing.T) {
@@ -164,7 +171,13 @@ func TestWrappedRequestParamsFlagUsages_FormatAnnotation(t *testing.T) {
 	cmd.Flags().SetAnnotation("description", "request", []string{"true"})
 	cmd.Flags().SetAnnotation("description", "apitype", []string{"string"})
 
+	cmd.Flags().String("file", "", "")
+	cmd.Flags().SetAnnotation("file", "request", []string{"true"})
+	cmd.Flags().SetAnnotation("file", "apitype", []string{"string"})
+	cmd.Flags().SetAnnotation("file", "format", []string{"binary"})
+
 	output := WrappedRequestParamsFlagUsages(cmd)
+	assert.Contains(t, output, "--file <file-path>")
 	assert.Contains(t, output, "--created <unix-time>")
 	assert.Contains(t, output, "--description <string>")
 }

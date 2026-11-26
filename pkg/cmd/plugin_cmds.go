@@ -10,8 +10,10 @@ import (
 	"github.com/spf13/afero"
 	"github.com/spf13/cobra"
 
+	"github.com/stripe/stripe-cli/pkg/cmdutil"
 	"github.com/stripe/stripe-cli/pkg/config"
 	"github.com/stripe/stripe-cli/pkg/errorcategory"
+	"github.com/stripe/stripe-cli/pkg/login"
 	"github.com/stripe/stripe-cli/pkg/plugins"
 	"github.com/stripe/stripe-cli/pkg/stripe"
 	"github.com/stripe/stripe-cli/pkg/validators"
@@ -33,7 +35,10 @@ type pluginTemplateCmd struct {
 	fs         afero.Fs
 	ParsedArgs []string
 
-	runPluginCmdFn func(cmd *cobra.Command, args []string) error
+	// runPluginCmdFn hands off to the plugin binary. skipAutoUpgrade leaves out the
+	// pre-run upgrade check, for a handoff that has nothing to gain from it; see
+	// runPluginCmd.
+	runPluginCmdFn func(cmd *cobra.Command, args []string, skipAutoUpgrade bool) error
 }
 
 // newPluginTemplateCmd is a generic plugin command template to dynamically use
@@ -50,8 +55,8 @@ func newPluginTemplateCmd(config *config.Config, plugin *plugins.Plugin) *plugin
 		Long:  plugin.Description,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// "stripe [host_flags...] plugin_name [plugin_subcommands...] [plugin_flags...]" => "[plugin_subcommands...] [plugin_flags...]"
-			pluginArgs := subsliceAfter(os.Args, cmd.Name())
-			return ptc.runPluginCmdFn(cmd, pluginArgs)
+			pluginArgs := cmdutil.ArgsAfter(os.Args, cmd.Name())
+			return ptc.runPluginCmdFn(cmd, pluginArgs, false)
 		},
 		Annotations: map[string]string{"scope": "plugin"},
 		FParseErrWhitelist: cobra.FParseErrWhitelist{
@@ -64,14 +69,17 @@ func newPluginTemplateCmd(config *config.Config, plugin *plugins.Plugin) *plugin
 		var args []string
 		if len(s) == 0 {
 			// "stripe help plugin_name [plugin_subcommands...]" => "[plugin_subcommands...] --help"
-			args = subsliceAfter(os.Args, c.Name())
+			args = cmdutil.ArgsAfter(os.Args, c.Name())
 			args = append(args, "--help")
 			c.SetContext(context.Background())
 		} else {
 			// "stripe plugin_name [plugin_subcommands...] --help" => "[plugin_subcommands...] --help"
-			args = subsliceAfter(s, c.Name())
+			args = cmdutil.ArgsAfter(s, c.Name())
 		}
-		ptc.runPluginCmdFn(c, args)
+		// Asking what a command does should not install software, hence the skip. Cobra
+		// passes this func down to every subcommand stub too, so `stripe plugin_name
+		// subcommand --help` lands here as well and is covered by the same decision.
+		ptc.runPluginCmdFn(c, args, true)
 	})
 
 	// Add subcommand stubs from manifest metadata so they appear in --map and help
@@ -92,8 +100,8 @@ func addPluginSubcommandStubs(parent *cobra.Command, commands []plugins.CommandI
 			Use:   ci.Name,
 			Short: ci.Desc,
 			RunE: func(cmd *cobra.Command, args []string) error {
-				pluginArgs := subsliceAfter(os.Args, ptc.cmd.Name())
-				return ptc.runPluginCmdFn(cmd, pluginArgs)
+				pluginArgs := cmdutil.ArgsAfter(os.Args, ptc.cmd.Name())
+				return ptc.runPluginCmdFn(cmd, pluginArgs, false)
 			},
 			Annotations: map[string]string{"scope": "plugin"},
 			FParseErrWhitelist: cobra.FParseErrWhitelist{
@@ -105,8 +113,45 @@ func addPluginSubcommandStubs(parent *cobra.Command, commands []plugins.CommandI
 	}
 }
 
-// runPluginCmd hands off to the plugin itself to take over
-func (ptc *pluginTemplateCmd) runPluginCmd(cmd *cobra.Command, args []string) error {
+// explicitFlagValue returns value if the named flag was explicitly set by the user, or "" if
+// it was left at its default. This is used to decide what to forward to a plugin via
+// AdditionalInfo: a plugin should only hear about a base URL override the user actually chose,
+// not the CLI's own resolved default.
+func explicitFlagValue(cmd *cobra.Command, name, value string) string {
+	if cmd.Flags().Changed(name) {
+		return value
+	}
+	return ""
+}
+
+// runPluginByName hands off to a plugin that was installed during this invocation
+// rather than at startup, which is how an auto-installing hint command runs the
+// user's original command. It reuses the template command so a just-installed
+// plugin gets the same execution, version-check, and exit-code handling as one
+// that was already present when the CLI started.
+//
+// The one thing it does differently is skip the upgrade check, because the install it
+// follows resolved the newest release moments ago -- there is nothing newer to find, and
+// this holds whether the plugin was installed to run a command or to print its own help.
+// It is an invariant of this function's contract rather than of its callers: anything
+// reaching a plugin that was not just installed should go through the template command's
+// normal path instead.
+func runPluginByName(cmd *cobra.Command, name string, args []string) error {
+	fs := afero.NewOsFs()
+
+	plugin, err := plugins.LookUpPlugin(commandContextOrBackground(cmd), &Config, fs, name)
+	if err != nil {
+		return err
+	}
+
+	return newPluginTemplateCmd(&Config, &plugin).runPluginCmd(cmd, args, true)
+}
+
+// runPluginCmd hands off to the plugin itself to take over.
+//
+// skipAutoUpgrade leaves out the pre-run upgrade check; see
+// Plugin.RunWithoutAutoUpgrade for which handoffs want that and why.
+func (ptc *pluginTemplateCmd) runPluginCmd(cmd *cobra.Command, args []string, skipAutoUpgrade bool) error {
 	ctx := withSIGTERMCancel(commandContextOrBackground(cmd), func() {
 		log.WithFields(log.Fields{
 			"prefix": "cmd.pluginCmd.runPluginCmd",
@@ -126,7 +171,42 @@ func (ptc *pluginTemplateCmd) runPluginCmd(cmd *cobra.Command, args []string) er
 		"prefix": "cmd.pluginCmd.runPluginCmd",
 	}).Debug("Running plugin...")
 
-	err = plugin.Run(ctx, ptc.cfg, fs, ptc.ParsedArgs, "", "")
+	// GetString only errors when the flag isn't registered on cmd, which shouldn't
+	// happen here since these plugin commands are always attached under rootCmd
+	// (where --api-base/--dashboard-base/--access-base are defined); fall back to
+	// the same defaults the root flags would carry just in case.
+	apiBaseURL, apiBaseErr := cmd.Flags().GetString("api-base")
+	if apiBaseErr != nil {
+		apiBaseURL = stripe.DefaultAPIBaseURL
+	}
+	if err := stripe.ValidateAPIBaseURL(apiBaseURL); err != nil {
+		return err
+	}
+	rawDashboardBaseURL, _ := cmd.Flags().GetString("dashboard-base")
+	dashboardBaseURLResolved := stripe.DashboardBaseURLForAPIBaseURL(apiBaseURL)
+	if rawDashboardBaseURL != "" {
+		dashboardBaseURLResolved = rawDashboardBaseURL
+	}
+	if err := stripe.ValidateDashboardBaseURL(dashboardBaseURLResolved); err != nil {
+		return err
+	}
+	accessBaseURL, accessBaseErr := cmd.Flags().GetString("access-base")
+	if accessBaseErr != nil {
+		accessBaseURL = login.DefaultAccessBaseURL
+	}
+	if err := login.ValidateAccessBaseURL(accessBaseURL); err != nil {
+		return err
+	}
+
+	run := plugin.Run
+	if skipAutoUpgrade {
+		run = plugin.RunWithoutAutoUpgrade
+	}
+
+	err = run(ctx, ptc.cfg, fs, ptc.ParsedArgs, "", "",
+		explicitFlagValue(cmd, "api-base", apiBaseURL),
+		explicitFlagValue(cmd, "dashboard-base", rawDashboardBaseURL),
+		explicitFlagValue(cmd, "access-base", accessBaseURL))
 	plugins.CleanupAllClients()
 	if err == nil {
 		dashboardBaseURL := stripe.DashboardBaseURLForAPIBaseURL(stripe.DefaultAPIBaseURL)
@@ -142,8 +222,18 @@ func (ptc *pluginTemplateCmd) runPluginCmd(cmd *cobra.Command, args []string) er
 			"prefix": "pluginTemplateCmd.runPluginCmd",
 		}).Debug(fmt.Sprintf("Plugin command '%s' exited with error: %s", plugin.Shortname, err))
 
-		// We can't return err because the plugin will have already printed the error message at
-		// this point, and we can't return nil because the host will exit with code 0.
+		// A plugin that started and then failed has already printed why, so printing
+		// it again would duplicate it. Anything else failed before the plugin was
+		// ever launched -- an install that failed, a plugin too old to read the
+		// config file, a handshake that never completed -- and nothing has printed
+		// it, so exiting silently here is the difference between an actionable
+		// message and a bare exit code 1.
+		if !plugins.PluginAlreadyReported(err) {
+			fmt.Fprintln(os.Stderr, err)
+		}
+
+		// We can't return err because it is either already printed or printed just
+		// above, and we can't return nil because the host would exit with code 0.
 		os.Exit(1)
 	}
 
@@ -156,19 +246,6 @@ func commandContextOrBackground(cmd *cobra.Command) context.Context {
 	}
 
 	return cmd.Context()
-}
-
-// Return a copy of sl strictly after the first occurrence of str, or empty slice if not found.
-func subsliceAfter(sl []string, str string) []string {
-	for i, s := range sl {
-		if s == str {
-			subsl := sl[i+1:]
-			res := make([]string, len(subsl))
-			copy(res, subsl)
-			return res
-		}
-	}
-	return make([]string, 0)
 }
 
 func resolvePluginTelemetryCommandPath(cmd *cobra.Command, argv []string) string {
@@ -188,13 +265,31 @@ func resolvePluginTelemetryCommandPath(cmd *cobra.Command, argv []string) string
 		return basePath
 	}
 
-	pluginArgs := subsliceAfter(argv, pluginRoot.Name())
+	pluginArgs := cmdutil.ArgsAfter(argv, pluginRoot.Name())
 	subcommand := firstPluginTelemetrySubcommand(pluginArgs)
-	if subcommand == "" {
+	if subcommand == "" || !isKnownPluginSubcommand(pluginRoot, subcommand) {
+		// Untrusted: argv might not be a subcommand at all (e.g. a plugin
+		// that doesn't declare Commands in its manifest yet, or the plugin's
+		// own positional argument data), and command_path can end up keyed
+		// as a Prometheus tag downstream, so don't pass through anything
+		// that isn't a name Cobra actually knows about.
 		return basePath
 	}
 
 	return basePath + " " + subcommand
+}
+
+// isKnownPluginSubcommand reports whether name is one of pluginRoot's
+// registered subcommand stubs, i.e. it came from the plugin manifest's
+// Commands metadata (see addPluginSubcommandStubs) rather than being
+// inferred from raw argv.
+func isKnownPluginSubcommand(pluginRoot *cobra.Command, name string) bool {
+	for _, c := range pluginRoot.Commands() {
+		if c.Name() == name {
+			return true
+		}
+	}
+	return false
 }
 
 func pluginRootCommand(cmd *cobra.Command) *cobra.Command {

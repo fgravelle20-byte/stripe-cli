@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -262,6 +263,50 @@ func TestReportingRetrieveCmd_HTTPRequest(t *testing.T) {
 	assert.Equal(t, requests.StripePreviewVersionHeaderValue, capturedReq.Header.Get("Stripe-Version"))
 }
 
+func TestReportingRetrieveCmd_RejectsInvalidPathSegments(t *testing.T) {
+	requests := make(chan struct{}, 1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests <- struct{}{}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	rc := newTestReportingRetrieveCmd(t, ts.URL)
+	for _, tt := range []struct {
+		id, wantError string
+	}{
+		{"", "path arguments cannot be empty"},
+		{".", "path arguments cannot be . or .."},
+		{"..", "path arguments cannot be . or .."},
+	} {
+		err := rc.runReportingQueryRunsRetrieveCmd(rc.cmd, []string{tt.id})
+		require.ErrorContains(t, err, tt.wantError)
+		require.Empty(t, requests)
+	}
+}
+
+func TestReportingRetrieveCmd_DotLikeIDsStayInPath(t *testing.T) {
+	for _, tt := range []struct {
+		id, wantURI string
+	}{
+		{"..?", queryRunsPath + "/..%3F"},
+		{"%2E%2E", queryRunsPath + "/%252E%252E"},
+	} {
+		t.Run(tt.id, func(t *testing.T) {
+			requestURIs := make(chan string, 1)
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requestURIs <- r.RequestURI
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer ts.Close()
+
+			rc := newTestReportingRetrieveCmd(t, ts.URL)
+			require.NoError(t, rc.runReportingQueryRunsRetrieveCmd(rc.cmd, []string{tt.id}))
+			require.Equal(t, tt.wantURI, <-requestURIs)
+		})
+	}
+}
+
 // --- Unit tests: command construction ---
 
 func TestNewReportingQueryRunsCreateCmd_IsPreview(t *testing.T) {
@@ -294,4 +339,75 @@ func TestNewReportingQueryRunsCreateCmd_Flags(t *testing.T) {
 	require.NotNil(t, cc.cmd.Flags().Lookup("sql"))
 	require.NotNil(t, cc.cmd.Flags().Lookup("sql-file"))
 	require.NotNil(t, cc.cmd.Flags().Lookup("compress-file"))
+}
+
+func TestNewReportingCmd_NotHidden(t *testing.T) {
+	rc := newReportingCmd()
+	assert.False(t, rc.cmd.Hidden, "reporting command must be listed in help")
+
+	queryRunsCmd, _, err := rc.cmd.Find([]string{"query-runs"})
+	require.NoError(t, err)
+	assert.False(t, queryRunsCmd.Hidden, "query-runs command must be listed in help")
+
+	createCmd, _, err := rc.cmd.Find([]string{"query-runs", "create"})
+	require.NoError(t, err)
+	assert.False(t, createCmd.Hidden, "query-runs create must be listed in help")
+
+	retrieveCmd, _, err := rc.cmd.Find([]string{"query-runs", "retrieve"})
+	require.NoError(t, err)
+	assert.False(t, retrieveCmd.Hidden, "query-runs retrieve must be listed in help")
+}
+
+func reportingHelpOutput(t *testing.T, args ...string) string {
+	t.Helper()
+	root := &cobra.Command{Use: "stripe"}
+	root.SetUsageTemplate(getUsageTemplate())
+	root.AddCommand(newReportingCmd().cmd)
+	out, err := executeCommand(root, args...)
+	require.NoError(t, err)
+	return out
+}
+
+func TestReportingCmd_HelpDescribesPublicPreview(t *testing.T) {
+	out := reportingHelpOutput(t, "reporting", "--help")
+
+	assert.Contains(t, out, "Public Preview")
+	assert.Contains(t, out, "query-runs")
+	assert.Contains(t, out, "Create and retrieve QueryRun objects")
+}
+
+func TestReportingQueryRunsCmd_HelpListsCreateAndRetrieve(t *testing.T) {
+	out := reportingHelpOutput(t, "reporting", "query-runs", "--help")
+
+	assert.Contains(t, out, "create")
+	assert.Contains(t, out, "Create a query run from custom SQL")
+	assert.Contains(t, out, "retrieve")
+	assert.Contains(t, out, "Retrieve a query run")
+}
+
+func TestReportingQueryRunsCreateCmd_HelpDescribesPublicPreview(t *testing.T) {
+	out := reportingHelpOutput(t, "reporting", "query-runs", "create", "--help")
+
+	assert.Contains(t, out, "Public Preview")
+	assert.Contains(t, out, "/v2/data/reporting/query_runs")
+	assert.Contains(t, out, "--compress-file")
+	assert.Contains(t, out, "--result_options[compress_file]=true")
+	assert.NotContains(t, out, "(sets result_options.compress_file)")
+
+	cc := newReportingQueryRunsCreateCmd()
+	usage := cc.cmd.Flags().Lookup("compress-file").Usage
+	assert.Contains(t, usage, "API parameter result_options.compress_file")
+	assert.Contains(t, usage, "--result_options[compress_file]=true")
+	assert.NotContains(t, usage, "(sets ")
+
+	alias := cc.cmd.Flags().Lookup("result_options[compress_file]")
+	require.NotNil(t, alias)
+	assert.True(t, alias.Hidden, "bracket alias must be hidden so it is not listed as its own flag")
+}
+
+func TestReportingQueryRunsRetrieveCmd_HelpDescribesPublicPreview(t *testing.T) {
+	out := reportingHelpOutput(t, "reporting", "query-runs", "retrieve", "--help")
+
+	assert.Contains(t, out, "Public Preview")
+	assert.Contains(t, out, "/v2/data/reporting/query_runs/{id}")
 }

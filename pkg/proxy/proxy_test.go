@@ -9,6 +9,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/stripe/stripe-cli/pkg/errorcategory"
 	"github.com/stripe/stripe-cli/pkg/requests"
 	"github.com/stripe/stripe-cli/pkg/stripe"
 	"github.com/stripe/stripe-cli/pkg/websocket"
@@ -88,6 +89,48 @@ func TestBuildEndpointRoutes(t *testing.T) {
 	require.Equal(t, []string{"Host: connecthostname"}, output[1].ForwardHeaders)
 	require.Equal(t, true, output[1].Connect)
 	require.Equal(t, []string{"*"}, output[1].EventTypes)
+}
+
+func TestInit_UseConfiguredWebhooks_APIError(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/v1/webhook_endpoints", r.URL.Path)
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`{"error":"internal_server_error"}`))
+	}))
+	defer ts.Close()
+
+	baseURL, _ := url.Parse(ts.URL)
+
+	cfg := Config{
+		Client:                &stripe.Client{Credentials: stripe.NewAPIKeyCredentials("sk_test_123"), BaseURL: baseURL},
+		UseConfiguredWebhooks: true,
+		ForwardURL:            "http://localhost:1234",
+	}
+
+	_, err := Init(context.Background(), &cfg)
+	require.Error(t, err)
+	require.NotContains(t, err.Error(), "you have not defined any webhook endpoints")
+}
+
+func TestInit_UseConfiguredWebhooks_NoEndpoints(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/v1/webhook_endpoints", r.URL.Path)
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"data":[]}`))
+	}))
+	defer ts.Close()
+
+	baseURL, _ := url.Parse(ts.URL)
+
+	cfg := Config{
+		Client:                &stripe.Client{Credentials: stripe.NewAPIKeyCredentials("sk_test_123"), BaseURL: baseURL},
+		UseConfiguredWebhooks: true,
+		ForwardURL:            "http://localhost:1234",
+	}
+
+	_, err := Init(context.Background(), &cfg)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "you have not defined any webhook endpoints")
 }
 
 func TestBuildForwardURL(t *testing.T) {
@@ -287,4 +330,9 @@ func TestRun_NoRetryOnAuthorizationClientError_TooManyRequests(t *testing.T) {
 	err = p.Run(context.Background())
 	require.ErrorContains(t, err, "you have too many `stripe listen` sessions open, please close some and try again")
 	require.Equal(t, 1, nAttempts)
+
+	// RateLimit keeps this expected, self-serviceable failure out of Sentry.
+	category, ok := errorcategory.Get(err)
+	require.True(t, ok)
+	require.Equal(t, errorcategory.RateLimit, category)
 }

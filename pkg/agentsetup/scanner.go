@@ -3,10 +3,7 @@ package agentsetup
 import (
 	"context"
 	"os"
-	"os/exec"
 	"strings"
-
-	"github.com/stripe/stripe-cli/pkg/errorcategory"
 )
 
 // LookPathFunc matches exec.LookPath and exists to make detection testable.
@@ -27,9 +24,9 @@ type ReadDirFunc func(string) ([]os.DirEntry, error)
 // StatFunc matches os.Stat and exists to make file existence checks testable.
 type StatFunc func(string) (os.FileInfo, error)
 
-// RunCommandFunc runs a command. The production implementation captures output
-// silently and returns a concise error on failure.
-type RunCommandFunc func(context.Context, string, ...string) error
+// RunCommandFunc runs a command and returns its standard output and a concise error
+// upon failure
+type RunCommandFunc func(context.Context, string, ...string) ([]byte, error)
 
 // Scanner scans local agent installations without mutating them.
 type Scanner struct {
@@ -43,52 +40,36 @@ type Scanner struct {
 
 // DefaultScanner returns a Scanner backed by the real OS.
 func DefaultScanner() Scanner {
-	return Scanner{
-		LookPath: exec.LookPath,
-		ReadFile: os.ReadFile,
-		HomeDir:  os.UserHomeDir,
-		WorkDir:  os.Getwd,
-		ReadDir:  os.ReadDir,
-		Stat:     os.Stat,
-	}
+	return Scanner{}.withDefaults()
 }
 
 func (s Scanner) withDefaults() Scanner {
-	defaults := DefaultScanner()
 	if s.LookPath == nil {
-		s.LookPath = defaults.LookPath
+		s.LookPath, _ = lazyExecutableResolver()
 	}
 	if s.ReadFile == nil {
-		s.ReadFile = defaults.ReadFile
+		s.ReadFile = os.ReadFile
 	}
 	if s.HomeDir == nil {
-		s.HomeDir = defaults.HomeDir
+		s.HomeDir = os.UserHomeDir
 	}
 	if s.WorkDir == nil {
-		s.WorkDir = defaults.WorkDir
+		s.WorkDir = os.Getwd
 	}
 	if s.ReadDir == nil {
-		s.ReadDir = defaults.ReadDir
+		s.ReadDir = os.ReadDir
 	}
 	if s.Stat == nil {
-		s.Stat = defaults.Stat
+		s.Stat = os.Stat
 	}
 	return s
 }
 
-// RunCommand runs a command silently. Plugin installs run behind a spinner, so
-// streaming subprocess stdio to the terminal would interleave with our animation.
-// On failure, return a single line from the subprocess output.
-func RunCommand(ctx context.Context, name string, args ...string) error {
-	cmd := exec.CommandContext(ctx, name, args...)
-	out, err := cmd.CombinedOutput()
-	if err == nil {
-		return nil
-	}
-	if msg := errorFromOutput(out); msg != "" {
-		return errorcategory.New(errorcategory.Internal, msg)
-	}
-	return err
+// RunCommand runs a command silently and returns its standard output. Plugin
+// installs run behind a spinner, so streaming subprocess stdio to the terminal
+// would interleave with our animation.
+func RunCommand(ctx context.Context, name string, args ...string) ([]byte, error) {
+	return newExecutableResolver().run(ctx, name, args...)
 }
 
 func errorFromOutput(out []byte) string {

@@ -4,14 +4,74 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"sync"
 	"testing"
+	"time"
 
 	sentry "github.com/getsentry/sentry-go"
 	"github.com/stretchr/testify/require"
 
+	"github.com/stripe/stripe-cli/pkg/docs"
 	"github.com/stripe/stripe-cli/pkg/errorcategory"
 	"github.com/stripe/stripe-cli/pkg/requests"
+	"github.com/stripe/stripe-cli/pkg/stripe"
 )
+
+// syncTelemetryClient records SendEvent calls and lets tests block until the
+// CaptureException/RecoverAndReport goroutine has delivered its event.
+type syncTelemetryClient struct {
+	mu     sync.Mutex
+	events []struct{ name, value, commandPath, httpOutcome string }
+	done   chan struct{}
+}
+
+func newSyncTelemetryClient() *syncTelemetryClient {
+	return &syncTelemetryClient{done: make(chan struct{}, 8)}
+}
+
+func (c *syncTelemetryClient) SendAPIRequestEvent(_ context.Context, _ string, _ bool) (*http.Response, error) {
+	return nil, nil
+}
+
+func (c *syncTelemetryClient) SendEvent(ctx context.Context, eventName string, eventValue string) {
+	commandPath, httpOutcome := "", ""
+	if metadata := stripe.GetEventMetadata(ctx); metadata != nil {
+		commandPath = metadata.CommandPath
+		httpOutcome = metadata.HTTPOutcome
+	}
+	c.mu.Lock()
+	c.events = append(c.events, struct{ name, value, commandPath, httpOutcome string }{eventName, eventValue, commandPath, httpOutcome})
+	c.mu.Unlock()
+	c.done <- struct{}{}
+}
+
+func (c *syncTelemetryClient) waitForEvent(t *testing.T) {
+	t.Helper()
+	select {
+	case <-c.done:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for a telemetry event to be sent")
+	}
+}
+
+func (c *syncTelemetryClient) lastEvent() (name string, value string, commandPath string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.events) == 0 {
+		return "", "", ""
+	}
+	last := c.events[len(c.events)-1]
+	return last.name, last.value, last.commandPath
+}
+
+func telemetryContext(client *syncTelemetryClient) context.Context {
+	ctx := stripe.WithTelemetryClient(context.Background(), client)
+	return stripe.WithEventMetadata(ctx, stripe.NewEventMetadata())
+}
 
 func TestCaptureExceptionSuppressesExpectedCategories(t *testing.T) {
 	tests := []struct {
@@ -20,18 +80,26 @@ func TestCaptureExceptionSuppressesExpectedCategories(t *testing.T) {
 	}{
 		{name: "user input", err: context.Canceled},
 		{name: "auth", err: requests.RequestError{StatusCode: 401}},
+		{name: "rate limit", err: requests.RequestError{StatusCode: 429}},
+		{name: "auth pointer", err: &requests.RequestError{StatusCode: 401}},
+		{name: "rate limit pointer", err: &requests.RequestError{StatusCode: 429}},
+		{name: "explicit user input with HTTP status", err: errorcategory.With(testHTTPStatusError(400), errorcategory.UserInput)},
+		{name: "explicit rate limit", err: errorcategory.New(errorcategory.RateLimit, "you have too many `stripe listen` sessions open, please close some and try again")},
 		{name: "wrapped user input", err: fmt.Errorf("wrapped: %w", context.Canceled)},
 		{name: "wrapped auth", err: fmt.Errorf("wrapped: %w", requests.RequestError{StatusCode: 403})},
+		{name: "wrapped rate limit", err: fmt.Errorf("wrapped: %w", requests.RequestError{StatusCode: 429})},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			transport, restore := bindTestClient(t)
 			defer restore()
+			telemetryClient := newSyncTelemetryClient()
 
-			CaptureException(test.err)
+			CaptureException(telemetryContext(telemetryClient), test.err)
 
 			require.Empty(t, transport.Events())
+			require.Empty(t, telemetryClient.events, "suppressed categories must not be mirrored to telemetry either")
 		})
 	}
 }
@@ -48,26 +116,245 @@ func TestCaptureExceptionCapturesActionableCategories(t *testing.T) {
 		t.Run(string(category), func(t *testing.T) {
 			transport, restore := bindTestClient(t)
 			defer restore()
+			telemetryClient := newSyncTelemetryClient()
 
-			CaptureException(errorcategory.With(errors.New("actionable error"), category))
+			CaptureException(telemetryContext(telemetryClient), errorcategory.With(errors.New("actionable error"), category))
 
 			events := transport.Events()
 			require.Len(t, events, 1)
 			require.Equal(t, string(category), events[0].Tags["error_category"])
+
+			telemetryClient.waitForEvent(t)
+			eventName, eventValue, commandPath := telemetryClient.lastEvent()
+			require.Equal(t, errorTelemetryEventName, eventName)
+			require.Equal(t, string(category), eventValue, "telemetry value must be the bare category, never the error message")
+			require.Equal(t, otherCommandBucket, commandPath)
 		})
 	}
+}
+
+// The Sentry issue title comes from the type of the outermost exception, which
+// is the errorcategory wrapper. Without the substitution in scrubEvent every
+// categorized error would be titled "errorcategory.categorizedError".
+func TestCaptureExceptionTitlesExceptionsWithTheCategory(t *testing.T) {
+	transport, restore := bindTestClient(t)
+	defer restore()
+
+	CaptureException(telemetryContext(newSyncTelemetryClient()), errorcategory.With(errors.New("actionable error"), errorcategory.API))
+
+	events := transport.Events()
+	require.Len(t, events, 1)
+
+	exceptions := events[0].Exception
+	require.NotEmpty(t, exceptions)
+	require.Equal(t, string(errorcategory.API), exceptions[len(exceptions)-1].Type)
+	require.NotContains(t, exceptions[len(exceptions)-1].Type, "categorizedError")
+}
+
+func TestCaptureExceptionLeavesUncategorizedExceptionTypes(t *testing.T) {
+	transport, restore := bindTestClient(t)
+	defer restore()
+
+	CaptureException(telemetryContext(newSyncTelemetryClient()), &os.PathError{Op: "open", Path: "config.toml", Err: errors.New("permission denied")})
+
+	events := transport.Events()
+	require.Len(t, events, 1)
+
+	exceptions := events[0].Exception
+	require.NotEmpty(t, exceptions)
+	require.Equal(t, "*fs.PathError", exceptions[len(exceptions)-1].Type)
 }
 
 func TestCaptureExceptionCapturesUnknownErrorsAsInternal(t *testing.T) {
 	transport, restore := bindTestClient(t)
 	defer restore()
 
-	CaptureException(errors.New("unknown error"))
+	CaptureException(telemetryContext(newSyncTelemetryClient()), errors.New("unknown error"))
 
 	events := transport.Events()
 	require.Len(t, events, 1)
 	require.Equal(t, string(errorcategory.Internal), events[0].Tags["error_category"])
 }
+
+func TestCaptureExceptionNeverSendsTheErrorMessageToTelemetry(t *testing.T) {
+	_, restore := bindTestClient(t)
+	defer restore()
+	telemetryClient := newSyncTelemetryClient()
+
+	CaptureException(telemetryContext(telemetryClient), errors.New("failed for account acct_1abcDEF at https://example.com/secret-path?token=xyz"))
+
+	telemetryClient.waitForEvent(t)
+	_, eventValue, _ := telemetryClient.lastEvent()
+	require.Equal(t, string(errorcategory.Internal), eventValue)
+}
+
+func TestCaptureExceptionBucketsTelemetryCommandWithoutMutatingMetadata(t *testing.T) {
+	_, restore := bindTestClient(t)
+	defer restore()
+	telemetryClient := newSyncTelemetryClient()
+	metadata := stripe.NewEventMetadata()
+	metadata.CommandPath = "stripe logs tail"
+	ctx := stripe.WithTelemetryClient(context.Background(), telemetryClient)
+	ctx = stripe.WithEventMetadata(ctx, metadata)
+
+	CaptureException(ctx, errors.New("actionable error"))
+
+	telemetryClient.waitForEvent(t)
+	_, _, commandPath := telemetryClient.lastEvent()
+	require.Equal(t, "logs_tail", commandPath)
+	require.Equal(t, "stripe logs tail", metadata.CommandPath)
+	require.Same(t, metadata, stripe.GetEventMetadata(ctx))
+}
+
+func TestCaptureExceptionBucketsGeneratedResourceTelemetry(t *testing.T) {
+	_, restore := bindTestClient(t)
+	defer restore()
+	telemetryClient := newSyncTelemetryClient()
+	metadata := stripe.NewEventMetadata()
+	metadata.CommandPath = "stripe customers create"
+	metadata.GeneratedResource = true
+	ctx := stripe.WithTelemetryClient(context.Background(), telemetryClient)
+	ctx = stripe.WithEventMetadata(ctx, metadata)
+
+	CaptureException(ctx, errors.New("actionable error"))
+
+	telemetryClient.waitForEvent(t)
+	_, _, commandPath := telemetryClient.lastEvent()
+	require.Equal(t, "resources", commandPath)
+	require.Equal(t, "stripe customers create", metadata.CommandPath)
+}
+
+func TestCaptureExceptionHTTPOutcome(t *testing.T) {
+	tests := []struct {
+		name        string
+		commandPath string
+		status      int
+		contentType string
+		wantOutcome string
+		wantBucket  string
+	}{
+		{name: "not found", commandPath: "stripe docs", status: 404, wantOutcome: "not_found", wantBucket: "docs"},
+		{name: "bad request", commandPath: "stripe docs search", status: 400, wantOutcome: "other_4xx", wantBucket: "docs"},
+		{name: "unauthorized", commandPath: "stripe docs", status: 401, wantOutcome: "other_4xx", wantBucket: "docs"},
+		{name: "forbidden", commandPath: "stripe docs", status: 403, wantOutcome: "other_4xx", wantBucket: "docs"},
+		{name: "rate limited", commandPath: "stripe docs", status: 429, wantOutcome: "other_4xx", wantBucket: "docs"},
+		{name: "server error", commandPath: "stripe docs api", status: 500, wantOutcome: "5xx", wantBucket: "docs"},
+		{name: "last client error", commandPath: "stripe docs", status: 499, wantOutcome: "other_4xx", wantBucket: "docs"},
+		{name: "last server error", commandPath: "stripe docs", status: 599, wantOutcome: "5xx", wantBucket: "docs"},
+		{name: "redirect", commandPath: "stripe docs", status: 302, wantOutcome: "other_non_200", wantBucket: "docs"},
+		{name: "created", commandPath: "stripe docs", status: 201, wantOutcome: "2xx", wantBucket: "docs"},
+		{name: "unsupported content type", commandPath: "stripe docs", status: 200, contentType: "text/html", wantBucket: "docs"},
+		{name: "other command", commandPath: "stripe listen", status: 404, wantOutcome: "not_found", wantBucket: "listen"},
+		{name: "unknown command", commandPath: "stripe custom", status: 500, wantOutcome: "5xx", wantBucket: "other"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			transport, restore := bindTestClient(t)
+			defer restore()
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", test.contentType)
+				w.WriteHeader(test.status)
+			}))
+			defer server.Close()
+			client := docs.NewClient("test").WithOptions(docs.WithBaseURL(server.URL))
+			_, err := client.FetchPage(context.Background(), &url.URL{Path: "/test", RawQuery: "query=test"})
+			require.Error(t, err)
+			telemetryClient := newSyncTelemetryClient()
+			metadata := &stripe.CLIAnalyticsEventMetadata{CommandPath: test.commandPath}
+			original := *metadata
+			ctx := stripe.WithEventMetadata(telemetryContext(telemetryClient), metadata)
+
+			CaptureException(ctx, fmt.Errorf("lookup failed: %w", err))
+
+			telemetryClient.waitForEvent(t)
+			require.Len(t, telemetryClient.events, 1)
+			event := telemetryClient.events[0]
+			require.Equal(t, errorTelemetryEventName, event.name)
+			require.Equal(t, "api", event.value)
+			require.Equal(t, test.wantBucket, event.commandPath)
+			require.Equal(t, test.wantOutcome, event.httpOutcome)
+			require.Equal(t, original, *metadata)
+			require.Same(t, metadata, stripe.GetEventMetadata(ctx))
+			require.Equal(t, "api", transport.Events()[0].Tags["error_category"])
+
+			telemetryClient.SendEvent(ctx, "Command", "")
+			require.Empty(t, telemetryClient.events[1].httpOutcome)
+			CaptureException(ctx, errors.New("docs: returned 404"))
+			require.Empty(t, telemetryClient.events[2].httpOutcome)
+			RecoverAndReport(ctx, "test panic")
+			require.Empty(t, telemetryClient.events[3].httpOutcome)
+		})
+	}
+}
+
+func TestCaptureExceptionHTTPOutcomeAcrossCommands(t *testing.T) {
+	tests := []struct {
+		name        string
+		err         error
+		metadata    stripe.CLIAnalyticsEventMetadata
+		wantBucket  string
+		wantValue   string
+		wantOutcome string
+	}{
+		{
+			name:       "request error value",
+			err:        requests.RequestError{StatusCode: 404},
+			metadata:   stripe.CLIAnalyticsEventMetadata{CommandPath: "stripe get"},
+			wantBucket: "get", wantValue: "api", wantOutcome: "not_found",
+		},
+		{
+			name:       "request error pointer",
+			err:        &requests.RequestError{StatusCode: 500},
+			metadata:   stripe.CLIAnalyticsEventMetadata{CommandPath: "stripe products list", GeneratedResource: true},
+			wantBucket: "resources", wantValue: "api", wantOutcome: "5xx",
+		},
+		{
+			name:       "custom status error",
+			err:        errorcategory.With(testHTTPStatusError(400), errorcategory.API),
+			metadata:   stripe.CLIAnalyticsEventMetadata{CommandPath: "stripe custom"},
+			wantBucket: "other", wantValue: "api", wantOutcome: "other_4xx",
+		},
+		{
+			name:       "non HTTP error clears inherited outcome",
+			err:        errors.New("ordinary error"),
+			metadata:   stripe.CLIAnalyticsEventMetadata{CommandPath: "stripe listen", HTTPOutcome: "5xx"},
+			wantBucket: "listen", wantValue: "internal",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, restore := bindTestClient(t)
+			defer restore()
+			client := newSyncTelemetryClient()
+			metadata := test.metadata
+			ctx := stripe.WithEventMetadata(telemetryContext(client), &metadata)
+
+			CaptureException(ctx, fmt.Errorf("wrapped: %w", test.err))
+
+			client.waitForEvent(t)
+			require.Len(t, client.events, 1)
+			require.Equal(t, errorTelemetryEventName, client.events[0].name)
+			require.Equal(t, test.wantValue, client.events[0].value)
+			require.Equal(t, test.wantBucket, client.events[0].commandPath)
+			require.Equal(t, test.wantOutcome, client.events[0].httpOutcome)
+			require.Equal(t, test.metadata, metadata)
+		})
+	}
+}
+
+func TestHTTPOutcomeIgnoresSuccessfulOrMissingStatus(t *testing.T) {
+	for _, status := range []int{0, http.StatusOK} {
+		require.Empty(t, httpOutcome(testHTTPStatusError(status)))
+	}
+	require.Empty(t, httpOutcome(nil))
+	require.Empty(t, httpOutcome(errors.New("returned 500")))
+}
+
+type testHTTPStatusError int
+
+func (e testHTTPStatusError) Error() string       { return "test HTTP error" }
+func (e testHTTPStatusError) HTTPStatusCode() int { return int(e) }
 
 func TestShouldCapture(t *testing.T) {
 	tests := []struct {
@@ -76,6 +363,7 @@ func TestShouldCapture(t *testing.T) {
 	}{
 		{category: errorcategory.UserInput, expected: false},
 		{category: errorcategory.Auth, expected: false},
+		{category: errorcategory.RateLimit, expected: false},
 		{category: errorcategory.Network, expected: true},
 		{category: errorcategory.API, expected: true},
 		{category: errorcategory.Filesystem, expected: true},
@@ -94,14 +382,24 @@ func TestShouldCapture(t *testing.T) {
 func TestRecoverAndReportSetsIsolatedPanicCategory(t *testing.T) {
 	transport, restore := bindTestClient(t)
 	defer restore()
+	telemetryClient := newSyncTelemetryClient()
+	ctx := stripe.WithTelemetryClient(context.Background(), telemetryClient)
 
-	RecoverAndReport("panic value")
-	CaptureException(errors.New("ordinary error"))
+	RecoverAndReport(ctx, "panic value")
+	CaptureException(ctx, errors.New("ordinary error"))
 
 	events := transport.Events()
 	require.Len(t, events, 2)
 	require.Equal(t, string(errorcategory.Panic), events[0].Tags["error_category"])
 	require.Equal(t, string(errorcategory.Internal), events[1].Tags["error_category"])
+
+	telemetryClient.waitForEvent(t)
+	telemetryClient.waitForEvent(t)
+	require.Len(t, telemetryClient.events, 2)
+	require.Equal(t, string(errorcategory.Panic), telemetryClient.events[0].value)
+	require.Equal(t, otherCommandBucket, telemetryClient.events[0].commandPath)
+	require.Equal(t, string(errorcategory.Internal), telemetryClient.events[1].value)
+	require.Equal(t, otherCommandBucket, telemetryClient.events[1].commandPath)
 }
 
 func bindTestClient(t *testing.T) (*sentry.MockTransport, func()) {

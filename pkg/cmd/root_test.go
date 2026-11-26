@@ -3,18 +3,32 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/mitchellh/go-homedir"
+	"github.com/spf13/afero"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"github.com/stretchr/testify/require"
 
 	"github.com/stripe/stripe-cli/pkg/cmd/resource"
+	"github.com/stripe/stripe-cli/pkg/cmd/resources"
 	"github.com/stripe/stripe-cli/pkg/config"
+	"github.com/stripe/stripe-cli/pkg/errorcategory"
+	"github.com/stripe/stripe-cli/pkg/plugins"
+	"github.com/stripe/stripe-cli/pkg/requests"
+	"github.com/stripe/stripe-cli/pkg/stripeauth"
 )
 
 func executeCommand(root *cobra.Command, args ...string) (output string, err error) {
@@ -34,6 +48,111 @@ func executeCommandC(root *cobra.Command, args ...string) (c *cobra.Command, out
 	root.SetArgs([]string{})
 
 	return c, buf.String(), err
+}
+
+func TestPluginUpgradeRouting(t *testing.T) {
+	for _, path := range [][]string{{"plugin", "upgrade"}, {"upgrade", "plugin"}} {
+		t.Run(strings.Join(path, " "), func(t *testing.T) {
+			for _, test := range []struct {
+				name      string
+				args      []string
+				wantCalls int
+				wantError bool
+				runError  error
+				wantHelp  bool
+			}{
+				{name: "target", args: []string{"apps"}, wantCalls: 1},
+				{name: "execution error", args: []string{"apps"}, wantCalls: 1, wantError: true, runError: errors.New("upgrade failed")},
+				{name: "missing target", wantError: true},
+				{name: "extra target", args: []string{"apps", "other"}, wantError: true},
+				{name: "help", args: []string{"--help"}, wantHelp: true},
+				{name: "flags", args: []string{"apps", "--api-base", "http://localhost:12111", "--dashboard-base", "http://localhost:12112"}, wantCalls: 1},
+			} {
+				t.Run(test.name, func(t *testing.T) {
+					root := &cobra.Command{Use: "stripe"}
+					root.AddCommand(newPluginCmd().cmd, newUpgradeCmd())
+					calls := 0
+					// Stub both handlers so a routing regression cannot download plugins.
+					for _, spelling := range [][]string{{"plugin", "upgrade"}, {"upgrade", "plugin"}} {
+						command, _, err := root.Find(spelling)
+						require.NoError(t, err)
+						command.RunE = func(cmd *cobra.Command, args []string) error {
+							calls++
+							require.Equal(t, strings.Join(append([]string{"stripe"}, path...), " "), cmd.CommandPath())
+							require.Equal(t, []string{"apps"}, args)
+							if test.name == "flags" {
+								apiBase, err := cmd.Flags().GetString("api-base")
+								require.NoError(t, err)
+								require.Equal(t, "http://localhost:12111", apiBase)
+								dashboardBase, err := cmd.Flags().GetString("dashboard-base")
+								require.NoError(t, err)
+								require.Equal(t, "http://localhost:12112", dashboardBase)
+							}
+							return test.runError
+						}
+					}
+					output, err := executeCommand(root, append(append([]string{}, path...), test.args...)...)
+					switch {
+					case test.runError != nil:
+						require.ErrorIs(t, err, test.runError)
+					case test.wantError:
+						require.ErrorContains(t, err, "requires exactly 1 positional argument")
+					default:
+						require.NoError(t, err)
+					}
+					require.Equal(t, test.wantCalls, calls)
+					if test.wantHelp {
+						require.Contains(t, output, strings.Join(append([]string{"stripe"}, path...), " ")+" <plugin>")
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestUpgradeGroupHelp(t *testing.T) {
+	group, _, err := rootCmd.Find([]string{"upgrade"})
+	require.NoError(t, err)
+	require.Equal(t, "upgrade", group.Name())
+	require.True(t, group.Hidden)
+	root := &cobra.Command{Use: "stripe"}
+	root.AddCommand(newUpgradeCmd())
+	command, _, err := root.Find([]string{"upgrade", "plugin"})
+	require.NoError(t, err)
+	command.RunE = func(*cobra.Command, []string) error {
+		t.Fatal("bare upgrade executed a plugin upgrade")
+		return nil
+	}
+	output, err := executeCommand(root, "upgrade")
+	require.NoError(t, err)
+	require.Contains(t, output, "stripe upgrade [command]")
+	require.Contains(t, output, "plugin")
+}
+
+func TestUnsafePluginStoragePreservesBuiltins(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX ownership and mode checks")
+	}
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("STRIPE_PLUGINS_PATH", "")
+	viper.Reset()
+	t.Cleanup(viper.Reset)
+	cfg := &config.Config{}
+	viper.Set("installed_plugins", []string{"sample", "builtin"})
+	fs := afero.NewMemMapFs()
+	configDir := cfg.GetConfigFolder(os.Getenv("XDG_CONFIG_HOME"))
+	require.NoError(t, fs.MkdirAll(configDir, 0755))
+	require.NoError(t, fs.Chmod(configDir, 0777))
+	root := &cobra.Command{Use: "stripe", Annotations: map[string]string{}}
+	called := false
+	root.AddCommand(&cobra.Command{Use: "builtin", Run: func(cmd *cobra.Command, args []string) { called = true }})
+	installed := registerInstalledPlugins(root, cfg, fs)
+	require.True(t, installed["sample"])
+	_, err := executeCommand(root, "builtin")
+	require.NoError(t, err)
+	require.True(t, called)
+	_, err = executeCommand(root, "sample", "--some-plugin-flag")
+	require.True(t, plugins.IsUnsafePluginStorage(err), "%v", err)
 }
 
 func TestGetPathNoXDG(t *testing.T) {
@@ -61,12 +180,42 @@ func TestHelpFlag(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestExecuteNormalizesBooleanRequestArgs(t *testing.T) {
+	previousRoot, previousArgs := rootCmd, os.Args
+	t.Cleanup(func() {
+		rootCmd, os.Args = previousRoot, previousArgs
+	})
+	rootCmd = &cobra.Command{Use: "stripe", Annotations: make(map[string]string)}
+	rootCmd.PersistentFlags().String("project-name", "default", "Project")
+	endpoints := resource.NewResourceCmd(rootCmd, "webhook_endpoints")
+	resource.NewOperationCmd(endpoints.Cmd, &resources.V1WebhookEndpointsUpdate, &config.Config{Profile: config.Profile{APIKey: "sk_test_1234"}})
+	var output bytes.Buffer
+	rootCmd.SetOut(&output)
+	os.Args = []string{"stripe", "webhook_endpoints", "update", "we_123", "--disabled", "false", "--dry-run", "-d", "items[]=one", "-d", "items[]=two"}
+
+	Execute(t.Context())
+
+	var preview requests.DryRunOutput
+	require.NoError(t, json.Unmarshal(output.Bytes(), &preview))
+	require.Equal(t, "https://api.stripe.com/v1/webhook_endpoints/we_123", preview.DryRun.URL)
+	require.Equal(t, map[string]interface{}{
+		"disabled": false,
+		"items":    []interface{}{"one", "two"},
+	}, preview.DryRun.Params)
+}
+
 func TestSandboxVisibleInHelp(t *testing.T) {
 	Execute(context.Background())
 
 	output, err := executeCommand(rootCmd, "--help")
 	require.NoError(t, err)
-	require.Contains(t, output, "sandbox")
+	require.Contains(t, output, "sandboxes")
+	parent, _, err := rootCmd.Find([]string{"sandboxes"})
+	require.NoError(t, err)
+	require.Equal(t, "sandboxes", parent.Name())
+	alias, _, err := rootCmd.Find([]string{"sandbox"})
+	require.NoError(t, err)
+	require.Same(t, parent, alias)
 }
 
 func TestExampleCommands(t *testing.T) {
@@ -81,10 +230,6 @@ func TestExampleCommands(t *testing.T) {
 	{
 		_, err := executeCommand(rootCmd, "post")
 		require.Equal(t, "`stripe post` requires exactly 1 positional argument. See `stripe post --help` for supported flags and usage", err.Error())
-	}
-	{
-		_, err := executeCommand(rootCmd, "samples", "create", "foo", "foo", "foo")
-		require.Equal(t, "`stripe samples create` accepts at maximum 2 positional arguments. See `stripe samples create --help` for supported flags and usage", err.Error())
 	}
 }
 
@@ -166,23 +311,151 @@ func TestV2BillingOverrides(t *testing.T) {
 	require.NoError(t, err)
 }
 
-func TestDatabasesHiddenButDirectlyAddressable(t *testing.T) {
-	root := &cobra.Command{
-		Use:         "stripe",
-		Annotations: map[string]string{"get": "http"},
-	}
-	root.SetUsageTemplate(getUsageTemplate())
-	root.AddCommand(&cobra.Command{Use: "version", Short: "Get the version of the Stripe CLI", RunE: noop})
-	err := resource.AddDatabasesCmd(root, &config.Config{})
-	require.NoError(t, err)
+// TestDocsRunsRootPersistentPreRun guards the root PersistentPreRunE against being
+// shadowed by a subcommand tree that declares its own. Cobra runs only the closest
+// such hook, so a subcommand that declares one silently disables config migration,
+// --access-base validation, Sentry command context, and command telemetry for
+// everything beneath it. `stripe docs` did exactly that from v1.43.3, when it was
+// inlined from a plugin, until its setup moved into RunE.
+//
+// The probe is --access-base: only the root hook rejects a non-Stripe value, so if
+// the root hook does not run, the invalid URL is accepted and the command proceeds.
+func TestDocsRunsRootPersistentPreRun(t *testing.T) {
+	previousAccessBase := rootAccessBaseURL
+	previousProfilesFile := Config.ProfilesFile
+	t.Cleanup(func() {
+		rootAccessBaseURL = previousAccessBase
+		Config.ProfilesFile = previousProfilesFile
+	})
 
-	helpOutput, err := executeCommand(root, "--help")
+	// Keep any config migration triggered by the root hook off the real config file.
+	Config.ProfilesFile = filepath.Join(t.TempDir(), "config.toml")
+
+	Execute(context.Background())
+
+	// A nested subcommand, so that the hook is reached through more than one parent.
+	_, err := executeCommand(rootCmd, "docs", "prefs", "list", "--access-base", "https://evil.example.com")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "invalid access base URL")
+}
+
+// TestNoBuiltInDatabasesCommand verifies that the fully registered root command
+// (built-in, generated and HTTP commands, post-processing, plugin hints) does not
+// contain a databases command when no plugins are installed.
+//
+// Command registration happens in init(), which reads installed plugins from the
+// user's config folder, so the assertions run in a subprocess with isolated
+// config and plugin directories.
+func TestNoBuiltInDatabasesCommand(t *testing.T) {
+	if os.Getenv("BE_TestNoBuiltInDatabasesCommand") == "1" {
+		assertNoBuiltInDatabasesCommand(t)
+		return
+	}
+
+	dir := t.TempDir()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestNoBuiltInDatabasesCommand$")
+	cmd.Env = append(os.Environ(),
+		"BE_TestNoBuiltInDatabasesCommand=1",
+		"HOME="+dir,
+		"XDG_CONFIG_HOME="+filepath.Join(dir, "config"),
+		"STRIPE_PLUGINS_PATH="+filepath.Join(dir, "plugins"),
+		"STRIPE_API_KEY=",
+		"STRIPE_CLI_TELEMETRY_OPTOUT=1",
+	)
+	output, err := cmd.CombinedOutput()
+	require.NoError(t, err, "subprocess failed:\n%s", output)
+}
+
+func assertNoBuiltInDatabasesCommand(t *testing.T) {
+	var requestCount atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount.Add(1)
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"object":"list","data":[],"has_more":false}`)) //nolint:errcheck
+	}))
+	defer ts.Close()
+
+	Config.ProfilesFile = filepath.Join(t.TempDir(), "config.toml")
+
+	// Command-tree membership: no command or alias named "databases" anywhere.
+	var walk func(c *cobra.Command)
+	walk = func(c *cobra.Command) {
+		for _, sub := range c.Commands() {
+			require.NotEqual(t, "databases", sub.Name(), "unexpected command %q", sub.CommandPath())
+			require.NotContains(t, sub.Aliases, "databases", "unexpected alias on %q", sub.CommandPath())
+			walk(sub)
+		}
+	}
+	walk(rootCmd)
+
+	// Command resolution fails without sending any request.
+	apiBase := "--api-base=" + ts.URL
+	apiKey := "--api-key=sk_test_1234567890"
+	for _, args := range [][]string{
+		{"databases", "list"},
+		{"databases", "users", "list"},
+	} {
+		_, err := executeCommand(rootCmd, append([]string{apiBase, apiKey}, args...)...)
+		require.Error(t, err, "args: %v", args)
+		require.Contains(t, err.Error(), `unknown command "databases"`)
+	}
+	require.Zero(t, requestCount.Load())
+
+	// Help, resources and completion output do not offer it.
+	helpOutput, err := executeCommand(rootCmd, "--help")
 	require.NoError(t, err)
 	require.NotContains(t, helpOutput, "databases")
 
-	output, err := executeCommand(root, "databases", "--help")
+	resourcesOutput, err := executeCommand(rootCmd, "resources")
 	require.NoError(t, err)
-	require.Contains(t, output, "Manage StripeDB")
-	require.Contains(t, output, "unstable preview APIs")
-	require.Contains(t, output, "users")
+	require.NotContains(t, resourcesOutput, "databases")
+
+	completionOutput, err := executeCommand(rootCmd, "__complete", "data")
+	require.NoError(t, err)
+	require.NotContains(t, completionOutput, "databases")
+
+	// An unrelated resource command still resolves and sends its request.
+	_, err = executeCommand(rootCmd, apiBase, apiKey, "customers", "list")
+	require.NoError(t, err)
+	require.Equal(t, int32(1), requestCount.Load())
+}
+
+func TestIsMorePermissionsRequiredError(t *testing.T) {
+	require.False(t, isMorePermissionsRequiredError(fmt.Errorf("other")))
+
+	// requests.RequestError, as returned by resource commands, trigger, fixtures, etc.
+	reqErr := requests.RequestError{StatusCode: http.StatusForbidden, ErrorCode: "more_permissions_required"}
+	require.True(t, isMorePermissionsRequiredError(reqErr))
+	require.False(t, isMorePermissionsRequiredError(requests.RequestError{StatusCode: http.StatusForbidden, ErrorCode: "resource_missing"}))
+
+	// stripeauth.AuthorizeHTTPError, as returned by the `stripe listen` / `stripe logs tail`
+	// session-auth flow. It's wrapped with errorcategory.Errorf(..., "%w", err) the same way
+	// proxy.go and logtailing/tailer.go wrap it before sending it out over the OutCh channel.
+	authErr := &stripeauth.AuthorizeHTTPError{StatusCode: http.StatusForbidden, ErrorCode: "more_permissions_required"}
+	wrapped := errorcategory.Errorf(errorcategory.Auth, "Error while authenticating with Stripe: %w", authErr)
+	require.True(t, isMorePermissionsRequiredError(wrapped))
+}
+
+func TestMorePermissionsRequiredMessage(t *testing.T) {
+	t.Run("requests.RequestError, API key", func(t *testing.T) {
+		reqErr := requests.RequestError{StatusCode: http.StatusForbidden, ErrorCode: "more_permissions_required", Message: "raw error message", HasOAKContext: false}
+		require.Equal(t, "raw error message", morePermissionsRequiredMessage(reqErr))
+	})
+
+	t.Run("requests.RequestError, OAuth/UAT", func(t *testing.T) {
+		reqErr := requests.RequestError{StatusCode: http.StatusForbidden, ErrorCode: "more_permissions_required", Message: "raw error message", HasOAKContext: true}
+		require.Equal(t, morePermissionsRequiredRoleMessage, morePermissionsRequiredMessage(reqErr))
+	})
+
+	t.Run("stripeauth.AuthorizeHTTPError, API key", func(t *testing.T) {
+		authErr := &stripeauth.AuthorizeHTTPError{StatusCode: http.StatusForbidden, ErrorCode: "more_permissions_required", Message: "raw error message", HasOAKContext: false}
+		wrapped := errorcategory.Errorf(errorcategory.Auth, "Error while authenticating with Stripe: %w", authErr)
+		require.Equal(t, "raw error message", morePermissionsRequiredMessage(wrapped))
+	})
+
+	t.Run("stripeauth.AuthorizeHTTPError, OAuth/UAT", func(t *testing.T) {
+		authErr := &stripeauth.AuthorizeHTTPError{StatusCode: http.StatusForbidden, ErrorCode: "more_permissions_required", Message: "raw error message", HasOAKContext: true}
+		wrapped := errorcategory.Errorf(errorcategory.Auth, "Error while authenticating with Stripe: %w", authErr)
+		require.Equal(t, morePermissionsRequiredRoleMessage, morePermissionsRequiredMessage(wrapped))
+	})
 }

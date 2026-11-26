@@ -35,6 +35,7 @@ import (
 type RequestParameters struct {
 	data          []string
 	expand        []string
+	headers       []string
 	startingAfter string
 	endingBefore  string
 	idempotency   string
@@ -52,6 +53,11 @@ func (r *RequestParameters) AppendData(data []string) {
 // AppendExpand appends fields to the expand parameter.
 func (r *RequestParameters) AppendExpand(fields []string) {
 	r.expand = append(r.expand, fields...)
+}
+
+// AppendHeaders appends custom headers to the request parameters.
+func (r *RequestParameters) AppendHeaders(headers []string) {
+	r.headers = append(r.headers, headers...)
 }
 
 // SetIdempotency sets the value for the `Idempotency-Key` header.
@@ -76,15 +82,22 @@ func (r *RequestParameters) SetVersion(value string) {
 
 // RequestError captures the response of the request that resulted in an error
 type RequestError struct {
-	msg        string
-	StatusCode int
-	ErrorType  string
-	ErrorCode  string
-	Body       interface{} // the raw response body
+	msg           string
+	StatusCode    int
+	ErrorType     string
+	ErrorCode     string
+	Message       string      // the human-readable "message" field from the error response body
+	HasOAKContext bool        // true if the request was authenticated with an OAuth/UAT token rather than a plain API key
+	Body          interface{} // the raw response body
 }
 
 func (e RequestError) Error() string {
 	return fmt.Sprintf("%s, status=%d, body=%s", e.msg, e.StatusCode, e.Body)
+}
+
+// HTTPStatusCode returns the response status for status-based error reporting.
+func (e RequestError) HTTPStatusCode() int {
+	return e.StatusCode
 }
 
 // IsAPIKeyExpiredError returns true if the provided error was caused by a
@@ -95,6 +108,20 @@ func IsAPIKeyExpiredError(err error) bool {
 	var reqErr RequestError
 	if errors.As(err, &reqErr) {
 		return reqErr.StatusCode == 401 && reqErr.ErrorCode == "api_key_expired"
+	}
+	return false
+}
+
+// MorePermissionsRequiredErrorCode is the Stripe API error code returned
+// when the API key's role does not have permission to perform a request.
+const MorePermissionsRequiredErrorCode = "more_permissions_required"
+
+// IsMorePermissionsRequiredError returns true if the provided error was
+// caused by a request returning a `more_permissions_required` error code.
+func IsMorePermissionsRequiredError(err error) bool {
+	var reqErr RequestError
+	if errors.As(err, &reqErr) {
+		return reqErr.StatusCode == http.StatusForbidden && reqErr.ErrorCode == MorePermissionsRequiredErrorCode
 	}
 	return false
 }
@@ -113,7 +140,8 @@ type Base struct {
 
 	DarkStyle bool
 
-	APIBaseURL string
+	APIBaseURL       string
+	RequestMediaType string
 
 	Livemode bool
 
@@ -198,12 +226,13 @@ func (rb *Base) InitFlags() {
 
 	rb.Cmd.Flags().StringArrayVarP(&rb.Parameters.data, "data", "d", []string{}, "Data for the API request")
 	rb.Cmd.Flags().StringArrayVarP(&rb.Parameters.expand, "expand", "e", []string{}, "Response attributes to expand inline")
+	rb.Cmd.Flags().StringArrayVarP(&rb.Parameters.headers, "request-header", "H", []string{}, "Set a custom request header (format: name: value)")
 	rb.Cmd.Flags().StringVarP(&rb.Parameters.idempotency, "idempotency", "i", "", "Set the idempotency key for the request, prevents replaying the same requests within 24 hours")
 	rb.Cmd.Flags().StringVarP(&rb.Parameters.version, "stripe-version", "v", "", "Set the Stripe API version to use for your request")
 	rb.Cmd.Flags().StringVar(&rb.Parameters.stripeAccount, "stripe-account", "", "Set a header identifying the connected account")
 	rb.Cmd.Flags().StringVar(&rb.Parameters.stripeContext, "stripe-context", "", "Set a header identifying the compartment context")
 	rb.Cmd.Flags().BoolVarP(&rb.showHeaders, "show-headers", "s", false, "Show response headers")
-	rb.Cmd.Flags().BoolVar(&rb.Livemode, "live", false, "Make a live request (default: test)")
+	rb.Cmd.Flags().BoolVar(&rb.Livemode, "live", false, "Make a live request (default: test). Requires that you're logged in to live mode — check with 'stripe whoami', switch with 'stripe switch'")
 	rb.Cmd.Flags().BoolVar(&rb.DarkStyle, "dark-style", false, "Use a darker color scheme better suited for lighter command-lines")
 	rb.Cmd.Flags().BoolVar(&rb.DryRun, "dry-run", false, "Preview the request without sending it")
 
@@ -235,9 +264,9 @@ func (rb *Base) ResolveCredentials() (stripe.Credentials, error) {
 	var mismatch *config.ActiveContextLivemodeMismatchError
 	if errors.As(err, &mismatch) {
 		if mismatch.ActiveLivemode {
-			return stripe.Credentials{}, errorcategory.UserInputErrorf("your active context is livemode; add --live to match it, or run 'stripe switch context' to select a test mode context")
+			return stripe.Credentials{}, errorcategory.UserInputErrorf("You're in live mode. Add --live to run the command, or run 'stripe switch' to select a sandbox.")
 		}
-		return stripe.Credentials{}, errorcategory.UserInputErrorf("your active context is test mode; remove --live to match it, or run 'stripe switch context' to select a livemode context")
+		return stripe.Credentials{}, errorcategory.UserInputErrorf("You're in a sandbox. Remove --live to run the command, or run 'stripe switch' to select a live account.")
 	}
 	return creds, err
 }
@@ -246,7 +275,17 @@ func (rb *Base) ResolveCredentials() (stripe.Credentials, error) {
 // Similar to making a multipart request using curl, add the local filepath to params arg with @ prefix.
 // e.g. params.AppendData([]string{"photo=@/path/to/local/file.png"})
 func (rb *Base) MakeMultiPartRequest(ctx context.Context, creds stripe.Credentials, path string, params *RequestParameters, errOnStatus bool) ([]byte, error) {
-	reqBody, contentType, err := rb.buildMultiPartRequest(params)
+	return rb.MakeMultiPartRequestWithAdditionalParams(ctx, creds, path, params, nil, errOnStatus)
+}
+
+// MakeMultiPartRequestWithAdditionalParams behaves like MakeMultiPartRequest, but also merges
+// additionalParams (e.g. non-file flag values) into the multipart request body.
+func (rb *Base) MakeMultiPartRequestWithAdditionalParams(ctx context.Context, creds stripe.Credentials, path string, params *RequestParameters, additionalParams map[string]interface{}, errOnStatus bool) ([]byte, error) {
+	bodyParams, err := createV1Params(params, additionalParams, nil)
+	if err != nil {
+		return nil, err
+	}
+	reqBody, contentType, err := rb.buildMultiPartRequest(bodyParams)
 	if err != nil {
 		return []byte{}, err
 	}
@@ -322,11 +361,23 @@ func credentialsFromPerformer(client stripe.RequestPerformer) stripe.Credentials
 }
 
 func (rb *Base) performRequest(ctx context.Context, client stripe.RequestPerformer, path string, params *RequestParameters, data string, errOnStatus bool, additionalConfigure func(req *http.Request) error) ([]byte, error) {
+	customHeaders, err := parseCustomHeaders(params.headers)
+	if err != nil {
+		return []byte{}, err
+	}
+	if stripeClient, ok := client.(*stripe.Client); ok && len(customHeaders) > 0 {
+		if stripeClient.VerbosePrintableHeaders == nil {
+			stripeClient.VerbosePrintableHeaders = stripe.DefaultPrintableHeaders()
+		}
+		stripeClient.VerbosePrintableHeaders = appendUniqueHeaderNames(stripeClient.VerbosePrintableHeaders, customHeaders)
+	}
+
 	creds := credentialsFromPerformer(client)
 	configure := func(req *http.Request) error {
 		rb.setIdempotencyHeader(req, params)
 		creds.ApplyAccountContextHeaders(req.Header, params.stripeAccount, params.stripeContext)
 		rb.setVersionHeader(req, params, path)
+		setCustomHeaders(req.Header, customHeaders)
 		if additionalConfigure != nil {
 			if err := additionalConfigure(req); err != nil {
 				return err
@@ -354,6 +405,7 @@ func (rb *Base) performRequest(ctx context.Context, client stripe.RequestPerform
 
 	if resp.StatusCode == 401 || (errOnStatus && resp.StatusCode >= 300) {
 		requestError := compileRequestError(body, resp.StatusCode)
+		requestError.HasOAKContext = creds.OAKContext != ""
 
 		// For OAK tokens, "unauthorized" means the token was manually revoked
 		// or otherwise invalidated server-side. Attempt a transparent refresh
@@ -408,7 +460,13 @@ func (rb *Base) performRequest(ctx context.Context, client stripe.RequestPerform
 
 // BuildDryRunOutput constructs the dry-run output for a request without executing it.
 func (rb *Base) BuildDryRunOutput(creds stripe.Credentials, baseURL, path string, params *RequestParameters, additionalParams map[string]interface{}) (*DryRunOutput, error) {
-	isV2 := stripe.IsV2Path(path)
+	isMultipart := rb.RequestMediaType == "multipart/form-data"
+	isV2 := stripe.IsV2Path(path) && !isMultipart
+	if isMultipart {
+		if _, err := createV1Params(params, additionalParams, nil); err != nil {
+			return nil, err
+		}
+	}
 
 	// Build params map
 	paramsMap := make(map[string]interface{})
@@ -478,11 +536,7 @@ func (rb *Base) BuildDryRunOutput(creds stripe.Credentials, baseURL, path string
 	}
 
 	if rb.Method != http.MethodGet {
-		if isV2 {
-			headers["Content-Type"] = "application/json"
-		} else {
-			headers["Content-Type"] = "application/x-www-form-urlencoded"
-		}
+		headers["Content-Type"] = rb.dryRunContentType(path)
 	}
 
 	if params.idempotency != "" {
@@ -505,6 +559,14 @@ func (rb *Base) BuildDryRunOutput(creds stripe.Credentials, baseURL, path string
 		headers["Authorization"] = "Bearer " + creds.Token
 	}
 
+	customHeaders, err := parseCustomHeaders(params.headers)
+	if err != nil {
+		return nil, err
+	}
+	for name, values := range customHeaders {
+		headers[name] = values[len(values)-1]
+	}
+
 	return &DryRunOutput{
 		DryRun: DryRunDetails{
 			Method:  rb.Method,
@@ -513,6 +575,17 @@ func (rb *Base) BuildDryRunOutput(creds stripe.Credentials, baseURL, path string
 			Headers: headers,
 		},
 	}, nil
+}
+
+func (rb *Base) dryRunContentType(path string) string {
+	switch {
+	case rb.RequestMediaType == "multipart/form-data":
+		return "multipart/form-data"
+	case stripe.IsV2Path(path):
+		return "application/json"
+	default:
+		return "application/x-www-form-urlencoded"
+	}
 }
 
 // parseV1DataForDryRun parses v1 key=value data entries into a nested map.
@@ -581,8 +654,9 @@ func setNestedValue(m map[string]interface{}, key string, value string) {
 
 func compileRequestError(body []byte, statusCode int) RequestError {
 	type requestErrorContent struct {
-		Code string `json:"code"`
-		Type string `json:"type"`
+		Code    string `json:"code"`
+		Type    string `json:"type"`
+		Message string `json:"message"`
 	}
 
 	type requestErrorBody struct {
@@ -598,6 +672,7 @@ func compileRequestError(body []byte, statusCode int) RequestError {
 		StatusCode: statusCode,
 		ErrorType:  errorBody.Content.Type,
 		ErrorCode:  errorBody.Content.Code,
+		Message:    errorBody.Content.Message,
 		Body:       string(body),
 	}
 }
@@ -838,7 +913,6 @@ func setQueryParams(queryParams *url.Values, paramsMap map[string]interface{}) e
 func (rb *Base) buildMultiPartRequest(params *RequestParameters) (*bytes.Buffer, string, error) {
 	var body bytes.Buffer
 	mp := multipart.NewWriter(&body)
-	defer mp.Close()
 
 	for _, datum := range params.data {
 		splitDatum := strings.SplitN(datum, "=", 2)
@@ -855,17 +929,34 @@ func (rb *Base) buildMultiPartRequest(params *RequestParameters) (*bytes.Buffer,
 			val = val[1:]
 			file, err := os.Open(val)
 			if err != nil {
-				return nil, "", err
+				return nil, "", errorcategory.Errorf(errorcategory.UserInput, "unable to open upload file %q: %w", val, err)
 			}
-			defer file.Close()
-			part, err := mp.CreateFormFile(key, val)
+			part, err := mp.CreateFormFile(key, filepath.Base(val))
 			if err != nil {
+				file.Close()
 				return nil, "", err
 			}
-			io.Copy(part, file)
+			_, copyErr := io.Copy(part, file)
+			closeErr := file.Close()
+			if copyErr != nil {
+				return nil, "", errorcategory.Errorf(errorcategory.UserInput, "unable to read upload file %q: %w", val, copyErr)
+			}
+			if closeErr != nil {
+				return nil, "", closeErr
+			}
 		} else {
-			mp.WriteField(key, val)
+			if err := mp.WriteField(key, val); err != nil {
+				return nil, "", err
+			}
 		}
+	}
+	for _, field := range params.expand {
+		if err := mp.WriteField("expand[]", field); err != nil {
+			return nil, "", err
+		}
+	}
+	if err := mp.Close(); err != nil {
+		return nil, "", err
 	}
 
 	return &body, mp.FormDataContentType(), nil
@@ -924,6 +1015,62 @@ func (rb *Base) computeVersionHeader(params *RequestParameters, path string) str
 		return StripeVersionHeaderValue
 	}
 	return ""
+}
+
+func parseCustomHeaders(headers []string) (http.Header, error) {
+	parsed := make(http.Header)
+	for _, header := range headers {
+		name, value, ok := strings.Cut(header, ":")
+		if !ok {
+			return nil, errorcategory.New(errorcategory.UserInput, "invalid header: expected name: value")
+		}
+		if !isValidHeaderName(name) {
+			return nil, errorcategory.New(errorcategory.UserInput, "invalid header name")
+		}
+		if strings.ContainsAny(value, "\r\n") {
+			return nil, errorcategory.New(errorcategory.UserInput, "invalid header value")
+		}
+		value = strings.Trim(value, " \t")
+		parsed.Set(name, value)
+	}
+	return parsed, nil
+}
+
+func isValidHeaderName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, char := range name {
+		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9') || strings.ContainsRune("!#$%&'*+-.^_`|~", char) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func setCustomHeaders(destination, custom http.Header) {
+	for name, values := range custom {
+		for _, value := range values {
+			destination.Set(name, value)
+		}
+	}
+}
+
+func appendUniqueHeaderNames(names []string, headers http.Header) []string {
+	seen := make(map[string]struct{}, len(names)+len(headers))
+	for _, name := range names {
+		seen[strings.ToLower(name)] = struct{}{}
+	}
+	for name := range headers {
+		key := strings.ToLower(name)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		names = append(names, name)
+		seen[key] = struct{}{}
+	}
+	return names
 }
 
 func (rb *Base) setVersionHeader(request *http.Request, params *RequestParameters, path string) {

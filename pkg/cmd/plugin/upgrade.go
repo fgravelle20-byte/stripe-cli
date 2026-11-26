@@ -81,20 +81,40 @@ func (uc *UpgradeCmd) runUpgradeCmd(cmd *cobra.Command, args []string) error {
 		if err := plugins.PersistInstalledPluginState(uc.cfg, uc.fs, *plugin); err != nil {
 			return err
 		}
+		if err := plugin.CleanupOtherVersions(uc.cfg, uc.fs, version); err != nil {
+			return err
+		}
+		if resolvedPlugin.CachedMetadata {
+			fmt.Println(color.Yellow(fmt.Sprintf("⚠ Could not check for updates; v%s is installed (using cached plugin metadata).", version)))
+			return nil
+		}
 		fmt.Println(color.Green(fmt.Sprintf("✔ v%s is already installed (latest).", version)))
 		return nil
 	}
 
 	prevVersion := plugin.InstalledVersion(uc.cfg, uc.fs)
 
-	if err := resolvedPlugin.Install(ctx, uc.cfg, uc.fs, uc.apiBaseURL, dashboardBaseURL); err != nil {
+	accessBaseURL, _ := cmd.Flags().GetString("access-base")
+	hookBaseURLs := plugins.HookBaseURLs{
+		APIBaseURL:       explicitFlagValue(cmd, "api-base", uc.apiBaseURL),
+		DashboardBaseURL: explicitFlagValue(cmd, "dashboard-base", uc.dashboardBaseURL),
+		AccessBaseURL:    explicitFlagValue(cmd, "access-base", accessBaseURL),
+	}
+
+	if err := resolvedPlugin.Install(ctx, uc.cfg, uc.fs, uc.apiBaseURL, dashboardBaseURL, hookBaseURLs); err != nil {
 		return err
 	}
 
-	sendPluginLifecycleEvent(cmd.Context(), "Plugin Upgraded", version)
+	runPostInstallHook(ctx, uc.cfg, uc.fs, plugin, version, prevVersion,
+		hookBaseURLs.APIBaseURL, hookBaseURLs.DashboardBaseURL, hookBaseURLs.AccessBaseURL)
+
+	plugins.SendPluginLifecycleEvent(cmd.Context(), plugins.PluginUpgradedEvent, version)
 
 	if prevVersion != "" {
 		fmt.Println(color.Green(fmt.Sprintf("✔ %s from v%s to v%s.", versionChangeVerb(prevVersion, version), prevVersion, version)))
+		// Always eligible here: upgrade takes no version, so the user only ever asked
+		// for the latest.
+		printUnrequestedDowngradeNote(os.Stdout, plugin.Shortname, prevVersion, version)
 	} else {
 		fmt.Println(color.Green(fmt.Sprintf("✔ upgrade to v%s complete.", version)))
 	}

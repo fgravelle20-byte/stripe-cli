@@ -9,7 +9,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/signal"
+	"slices"
 	"strings"
+	"syscall"
 	"unicode"
 
 	log "github.com/sirupsen/logrus"
@@ -31,6 +34,7 @@ import (
 	"github.com/stripe/stripe-cli/pkg/plugins"
 	"github.com/stripe/stripe-cli/pkg/requests"
 	"github.com/stripe/stripe-cli/pkg/stripe"
+	"github.com/stripe/stripe-cli/pkg/stripeauth"
 	"github.com/stripe/stripe-cli/pkg/useragent"
 	"github.com/stripe/stripe-cli/pkg/validators"
 	"github.com/stripe/stripe-cli/pkg/version"
@@ -39,7 +43,11 @@ import (
 // Config is the cli configuration for the user
 var Config config.Config
 
-var rootAccessBaseURL string
+var (
+	rootAccessBaseURL    string
+	rootAPIBaseURL       string
+	rootDashboardBaseURL string
+)
 
 var fs = afero.NewOsFs()
 
@@ -55,12 +63,10 @@ var rootCmd = &cobra.Command{
 		"trigger":   "webhooks",
 		"listen":    "webhooks",
 		"logs":      "stripe",
-		"status":    "stripe",
 		"resources": "resources",
-		AIAgentHelpAnnotationKey: "  If you do not have an account, run `stripe sandbox create` (provisions a claimable sandbox without a browser).\n" +
-			"  Visit https://docs.stripe.com/llms.txt?utm_source=cli for latest guidance on how to integrate correctly.\n" +
-			"  Run `npx skills add --all stripe/ai` to add all Stripe AI skills to your agent.\n" +
-			"  Additional commands (apps, directory, generate, projects) are available as installable plugins — run the command directly to be prompted, or use `stripe plugin install <name>`.",
+		AIAgentHelpAnnotationKey: "  If you do not have an account, run `stripe sandboxes create` (provisions a claimable sandbox without a browser).\n" +
+			"  Run `stripe agent setup` to install or update the Stripe plugin.\n" +
+			"  Additional commands (apps, directory, generate, projects) are available as installable plugins — run the command directly to install, or use `stripe plugin install <name>`.",
 	},
 	Version: version.Version,
 	Short:   "A CLI to help you integrate Stripe with your application",
@@ -72,6 +78,12 @@ var rootCmd = &cobra.Command{
 		if cmd.Name() == "help" {
 			fullHelpMode = true
 		}
+
+		// Move the config file to the v2 layout before the command reads anything
+		// out of it. This lives here rather than in InitConfig because Go plugins
+		// call InitConfig directly, and would otherwise rewrite the user's config
+		// file themselves at arbitrary times.
+		migrateConfigIfNeeded(cmd)
 
 		// --access-base is a hidden persistent flag accepted by every command, and
 		// feeds the OAuth token refresher below, which runs silently on any command
@@ -87,6 +99,11 @@ var rootCmd = &cobra.Command{
 		Config.Profile.OAuthAccessBaseURL = rootAccessBaseURL
 
 		reporting.SetCommandPath(cmd.CommandPath())
+
+		// Warn here rather than in InitConfig: the profile name can come from the
+		// persisted project-name key or STRIPE_PROJECT_NAME, and ReBindKeys applies
+		// both of those after InitConfig has already run.
+		Config.Profile.WarnIfLegacyProfileName()
 
 		// if getting the config errors, don't fail running the command
 		merchant, _ := Config.Profile.GetAccountID()
@@ -106,6 +123,7 @@ var rootCmd = &cobra.Command{
 			})
 			flagsStr := strings.Join(flags, ",")
 			telemetryMetadata.SetCommandFlags(flagsStr)
+			setPluginCommandTelemetryMetadata(cmd, args)
 		}
 
 		// plugins send their own telemetry due to having richer context than the CLI does
@@ -120,6 +138,12 @@ var rootCmd = &cobra.Command{
 func sendCommandInvocationEvent(ctx context.Context) {
 	telemetryClient := stripe.GetTelemetryClient(ctx)
 	if telemetryClient != nil {
+		// RunE may enrich the command's metadata while this request is pending.
+		// Keep the invocation's target fixed before starting the sender.
+		if metadata := stripe.GetEventMetadata(ctx); metadata != nil {
+			invocationMetadata := *metadata
+			ctx = stripe.WithEventMetadata(ctx, &invocationMetadata)
+		}
 		go telemetryClient.SendEvent(ctx, "Command Invoked", "Cobra")
 	}
 }
@@ -137,14 +161,42 @@ func showSuggestion() {
 		os.Args[1], rootCmd.CommandPath(), suggStr))
 }
 
+// installPluginReaper guarantees every plugin subprocess this CLI launched -- including
+// peer plugins started on another plugin's behalf via CoreCLIHelper.RunPeerPlugin -- gets
+// killed if this process is interrupted or terminated, not just when a plugin's blocking
+// RunCommand call returns normally. Without this, a peer plugin can be left running
+// indefinitely past the end of the command that started it: the OS doesn't reliably deliver
+// the parent's signal to it, and the host's RPC call to its own direct child plugin isn't
+// wired to any cancellable context, so nothing here today reaps it on its own.
+//
+// plugins.CleanupAllClients kills every client go-plugin is tracking for this process, so one
+// handler covers both the plain "launch one plugin" case and the nested peer-plugin case.
+func installPluginReaper() {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		plugins.CleanupAllClients()
+		os.Exit(1)
+	}()
+}
+
 // Execute adds all child commands to the root command and sets flags appropriately.
 // This is called by main.main(). It only needs to happen once to the rootCmd.
 func Execute(ctx context.Context) {
+	installPluginReaper()
+
 	emitClaudeCodePluginHint()
 
 	reporting.SetAccountIDProvider(Config.Profile.GetAccountID)
 
-	telemetryMetadata := stripe.NewEventMetadata()
+	// Reuse metadata the caller already attached to ctx (main.go does this so
+	// a panic recovered outside Execute still shares the same populated
+	// metadata pointer) rather than always creating a fresh one.
+	telemetryMetadata := stripe.GetEventMetadata(ctx)
+	if telemetryMetadata == nil {
+		telemetryMetadata = stripe.NewEventMetadata()
+	}
 	updatedCtx := stripe.WithEventMetadata(ctx, telemetryMetadata)
 
 	rootCmd.SetUsageTemplate(getUsageTemplate())
@@ -163,6 +215,11 @@ func Execute(ctx context.Context) {
 		return
 	}
 
+	args := os.Args[1:]
+	if normalized := resource.NormalizeBooleanRequestArgs(rootCmd, args); !slices.Equal(args, normalized) {
+		rootCmd.SetArgs(normalized)
+	}
+
 	if err := rootCmd.ExecuteContext(updatedCtx); err != nil {
 		errString := err.Error()
 
@@ -172,8 +229,12 @@ func Execute(ctx context.Context) {
 		switch {
 		case errors.Is(err, errNotAuthenticated):
 			// whoami already printed output; just exit non-zero
+		case errors.Is(err, errCommandRemoved):
+			// the shim already printed the removal guidance; just exit non-zero
 		case requests.IsAPIKeyExpiredError(err):
 			fmt.Fprintln(os.Stderr, apiKeyExpiredMessage(projectNameFlag))
+		case isMorePermissionsRequiredError(err):
+			fmt.Fprintln(os.Stderr, morePermissionsRequiredMessage(err))
 		case isLoginRequiredError && projectNameFlag != "default":
 			fmt.Fprintf(os.Stderr, "You provided the project name \"%[1]s\" (either via the \"--project-name\" flag or the \"STRIPE_PROJECT_NAME\" environment variable), but no config for that project was found.\nPlease run `stripe login --project-name=%[1]s` to enable commands for this project.\n", projectNameFlag)
 		case isLoginRequiredError:
@@ -186,12 +247,12 @@ func Execute(ctx context.Context) {
 				fmt.Fprintln(os.Stderr, "  If you already have a key: set STRIPE_API_KEY or pass --api-key <key>.")
 				fmt.Fprintln(os.Stderr, "  To authenticate to an existing account: run `stripe login` (outputs a browser URL for the user).")
 				if useragent.DetectAIAgent(os.Getenv) != "" {
-					fmt.Fprintln(os.Stderr, "  If you do not have an account, run `stripe sandbox create` (provisions a claimable sandbox).")
+					fmt.Fprintln(os.Stderr, "  If you do not have an account, run `stripe sandboxes create` (provisions a claimable sandbox).")
 				}
 			} else {
 				fmt.Fprintf(os.Stderr, "%s. Running `stripe login`...\n", string(errRunes))
 
-				err = login.Login(updatedCtx, stripe.DefaultDashboardBaseURL, rootAccessBaseURL, &Config)
+				err = login.Login(updatedCtx, stripe.DefaultDashboardBaseURL, rootAccessBaseURL, rootAPIBaseURL, &Config)
 
 				if err != nil {
 					fmt.Fprintln(os.Stderr, err)
@@ -200,10 +261,10 @@ func Execute(ctx context.Context) {
 
 		case strings.Contains(errString, "unknown command"):
 			showSuggestion()
-			recordUnknownCommand(updatedCtx, strings.Join(os.Args[1:], " "))
+			recordUnknownCommand(updatedCtx, sanitizeUnknownCommand(os.Args[1:]))
 
 		default:
-			reporting.CaptureException(err)
+			reporting.CaptureException(updatedCtx, err)
 			fmt.Fprintln(os.Stderr, err)
 		}
 
@@ -225,6 +286,36 @@ func apiKeyExpiredMessage(profileName string) string {
 	}
 	return fmt.Sprintf("The API key for profile %q has expired. Run `stripe login --project-name=%s` to re-authenticate.", profileName, profileName)
 }
+
+// isMorePermissionsRequiredError reports whether err was caused by a Stripe
+// API request failing because the API key's role lacks the permissions
+// required for that request. Requests made through pkg/requests surface this
+// as a requests.RequestError; the websocket session-auth flows used by
+// `stripe listen` and `stripe logs tail` surface it as a
+// stripeauth.AuthorizeHTTPError instead.
+func isMorePermissionsRequiredError(err error) bool {
+	return requests.IsMorePermissionsRequiredError(err) || stripeauth.IsMorePermissionsRequiredError(err)
+}
+
+// morePermissionsRequiredMessage returns the message to show the user for a
+// more_permissions_required error. Requests authenticated with a plain API
+// key have no notion of "role", so the raw message from the Stripe API is
+// shown instead of the role-reassignment message.
+func morePermissionsRequiredMessage(err error) string {
+	var reqErr requests.RequestError
+	if errors.As(err, &reqErr) && !reqErr.HasOAKContext {
+		return reqErr.Message
+	}
+
+	var authErr *stripeauth.AuthorizeHTTPError
+	if errors.As(err, &authErr) && !authErr.HasOAKContext {
+		return authErr.Message
+	}
+
+	return morePermissionsRequiredRoleMessage
+}
+
+const morePermissionsRequiredRoleMessage = "You don't have permission to do this with your current role. Ask an account administrator to assign you a different role with more permissions."
 
 var keysToReBind []string
 
@@ -257,7 +348,7 @@ func bindEnv(key, envKey string) {
 func init() {
 	cobra.OnInitialize(Config.InitConfig, ReBindKeys)
 
-	rootCmd.PersistentFlags().StringVar(&Config.Profile.APIKey, "api-key", "", "Your API key to use for the command")
+	rootCmd.PersistentFlags().StringVar(&Config.Profile.APIKey, "api-key", "", "Your API key to use for the command, instead of your logged in session. Overridden by the STRIPE_API_KEY environment variable, if set")
 	rootCmd.PersistentFlags().StringVar(&Config.Color, "color", "", "turn on/off color output (on, off, auto)")
 	rootCmd.PersistentFlags().StringVar(&Config.ProfilesFile, "config", "", "config file (default is $HOME/.config/stripe/config.toml)")
 	rootCmd.PersistentFlags().StringVar(&Config.Profile.DeviceName, "device-name", "", "device name")
@@ -268,6 +359,15 @@ func init() {
 	rootCmd.Flags().BoolP("version", "v", false, "Get the version of the Stripe CLI")
 	rootCmd.PersistentFlags().StringVar(&rootAccessBaseURL, "access-base", login.DefaultAccessBaseURL, "Sets the access base URL")
 	rootCmd.PersistentFlags().MarkHidden("access-base") //nolint:errcheck
+	// --api-base and --dashboard-base are hidden persistent flags used by the plugin
+	// subsystem (install/upgrade/uninstall/provision/etc.) to target a non-default
+	// environment (e.g. QA/dev). They're only forwarded to plugins when the user
+	// explicitly sets them (see the explicitFlagValue helpers alongside their callers).
+	rootCmd.PersistentFlags().StringVar(&rootAPIBaseURL, "api-base", stripe.DefaultAPIBaseURL, "Sets the API base URL")
+	rootCmd.PersistentFlags().MarkHidden("api-base") //nolint:errcheck
+	rootCmd.PersistentFlags().StringVar(&rootDashboardBaseURL, "dashboard-base", "", "Sets the Dashboard base URL")
+	rootCmd.PersistentFlags().MarkHidden("dashboard-base") //nolint:errcheck
+	rootCmd.SetFlagErrorFunc(flagErrorWithNestedAPIHint)
 
 	// tell viper to monitor the following flags:
 	// they will be available via viper.get(KEY), but not mapped back to the Config (by default; see below)
@@ -288,32 +388,31 @@ func init() {
 	rootCmd.AddCommand(newListenCmd().cmd)
 	rootCmd.AddCommand(newLoginCmd().cmd)
 	rootCmd.AddCommand(newLogoutCmd().cmd)
-	rootCmd.AddCommand(newReauthCmd().cmd)
 	rootCmd.AddCommand(newLogsCmd(&Config).Cmd)
 	rootCmd.AddCommand(newOpenCmd().cmd)
+	rootCmd.AddCommand(newReauthCmd().cmd)
 	rootCmd.AddCommand(newResourcesCmd().cmd)
-	rootCmd.AddCommand(newSamplesCmd().cmd)
-	rootCmd.AddCommand(newServeCmd().cmd)
+	rootCmd.AddCommand(newSamplesCmd())
+	rootCmd.AddCommand(newServeCmd())
+	rootCmd.AddCommand(newStatusCmd())
 	rootCmd.AddCommand(newSwitchCmd().cmd)
-	// current stripe status site is being deprecated
-	// hide status command until status site v2 is released
-	// rootCmd.AddCommand(newStatusCmd().cmd)
 	rootCmd.AddCommand(newTriggerCmd().cmd)
 	rootCmd.AddCommand(newVersionCmd().cmd)
 	rootCmd.AddCommand(newWhoamiCmd().cmd)
 	rootCmd.AddCommand(newPostinstallCmd(&Config).cmd)
+	rootCmd.AddCommand(newProvisionCmd().cmd)
 	rootCmd.AddCommand(newCommunityCmd().cmd)
 	rootCmd.AddCommand(newSandboxCmd().cmd)
 	rootCmd.AddCommand(newPluginCmd().cmd)
+	rootCmd.AddCommand(newUpgradeCmd())
 	resources.AddAllResourcesCmds(rootCmd, &Config)
-	registerHTTPCmds(rootCmd)
-	err := resource.AddDatabasesCmd(rootCmd, &Config)
-	if err != nil {
-		log.Fatal(err)
+	if terminalCmd, ok := cmdutil.FindSubCmd(rootCmd, "terminal"); ok {
+		terminalCmd.AddCommand(newTerminalQuickstartCmd())
 	}
+	registerHTTPCmds(rootCmd)
 	addV2BillingStubs(rootCmd)
 
-	err = resource.PostProcessResourceCommands(rootCmd, &Config)
+	err := resource.PostProcessResourceCommands(rootCmd, &Config)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -324,8 +423,9 @@ func init() {
 	installedPluginSet := registerInstalledPlugins(rootCmd, &Config, afero.NewOsFs())
 
 	// For known plugins not yet installed, add a hint command so users get
-	// a helpful message instead of "unknown command".
-	pluginhints.AddHintCommands(rootCmd, &Config, installedPluginSet)
+	// a helpful message instead of "unknown command". Plugins that auto-install
+	// use runPluginByName to run the user's command once the install finishes.
+	pluginhints.AddHintCommands(rootCmd, &Config, installedPluginSet, runPluginByName)
 }
 
 func registerInstalledPlugins(root *cobra.Command, cfg *config.Config, fs afero.Fs) map[string]bool {
@@ -348,6 +448,18 @@ func registerInstalledPlugins(root *cobra.Command, cfg *config.Config, fs afero.
 	for _, pluginName := range pluginNames {
 		plugin, err := plugins.LookUpPlugin(context.Background(), cfg, fs, pluginName)
 		if err != nil {
+			if plugins.IsUnsafePluginStorage(err) && plugins.ValidatePluginShortname(pluginName) == nil && strings.IndexFunc(pluginName, unicode.IsSpace) < 0 {
+				// Keep built-ins available, but do not route a known installed
+				// plugin through first-use installation after a trust failure.
+				if _, exists := cmdutil.FindSubCmd(root, pluginName); !exists {
+					storageErr := err
+					root.AddCommand(&cobra.Command{
+						Use: pluginName, DisableFlagParsing: true,
+						RunE: func(cmd *cobra.Command, args []string) error { return storageErr },
+					})
+				}
+				installedPluginSet[pluginName] = true
+			}
 			continue
 		}
 		installedPluginSet[pluginName] = true

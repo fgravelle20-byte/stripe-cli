@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"strings"
 
@@ -44,11 +43,11 @@ func newReportingCmd() *reportingCmd {
 	rc := &reportingCmd{}
 	rc.cmd = &cobra.Command{
 		Use:   "reporting",
-		Short: "Run Stripe Sigma queries via the Data Reporting API",
+		Short: "Run Stripe Sigma queries via the Data Reporting API (Public Preview)",
 		Long: `Run ad hoc SQL queries against your Stripe data using the Data Reporting API.
 
 Use the query-runs subcommands to kick off a new query and retrieve its
-results. This uses the /v2/data/reporting/query_runs preview API.`,
+results. This uses the /v2/data/reporting/query_runs Public Preview API.`,
 		Args: validators.NoArgs,
 	}
 
@@ -60,7 +59,7 @@ func newReportingQueryRunsCmd() *reportingQueryRunsCmd {
 	qrc := &reportingQueryRunsCmd{}
 	qrc.cmd = &cobra.Command{
 		Use:   "query-runs",
-		Short: "Create and retrieve QueryRun objects",
+		Short: "Create and retrieve QueryRun objects (Public Preview)",
 		Long: `Create and retrieve QueryRun objects.
 
 A QueryRun runs a custom SQL query against your Stripe data. Create a query run
@@ -85,11 +84,11 @@ func newReportingQueryRunsCreateCmd() *reportingQueryRunsCreateCmd {
 
 	cc.cmd = &cobra.Command{
 		Use:   "create",
-		Short: "Create a query run from custom SQL",
+		Short: "Create a query run from custom SQL (Public Preview)",
 		Long: `Create a query run to execute a custom, ad hoc SQL query against your Stripe data.
 
-Sends a POST request to /v2/data/reporting/query_runs. This is a preview API —
-the Stripe-Version preview header is set automatically.
+Sends a POST request to /v2/data/reporting/query_runs. This is a Public Preview
+API — the Stripe-Version preview header is set automatically.
 
 The query runs asynchronously. The response contains the query run's id and
 status ("running", "succeeded", or "failed"); poll it with
@@ -97,25 +96,33 @@ status ("running", "succeeded", or "failed"); poll it with
 then use the result's download_url to fetch the output.
 
 Provide the SQL inline with --sql, from a file with --sql-file, or via stdin
-by passing --sql-file -.`,
+by passing --sql-file -.
+
+Nested API fields use bracket notation as flags (for example
+--result_options[compress_file]=true), not dotted names from the API
+reference (--result_options.compress_file). Prefer the dedicated
+--compress-file flag when one exists.`,
 		Example: `  # Run an ad hoc query
   stripe reporting query-runs create --sql "SELECT * FROM charges LIMIT 10"
 
-  # Read the SQL from a file
-  stripe reporting query-runs create --sql-file ./query.sql
-
-  # Read the SQL from stdin
-  cat query.sql | stripe reporting query-runs create --sql-file -`,
+  # Compress the result file
+  stripe reporting query-runs create --sql "SELECT * FROM charges LIMIT 10" --compress-file`,
 		RunE: cc.runReportingQueryRunsCreateCmd,
 		Args: validators.NoArgs,
 	}
 
 	cc.cmd.Flags().StringVar(&cc.sql, "sql", "", "The SQL query to run [required unless --sql-file is set]")
 	cc.cmd.Flags().StringVar(&cc.sqlFile, "sql-file", "", "Path to a file containing the SQL query to run. Use \"-\" to read from stdin.")
-	cc.cmd.Flags().BoolVar(&cc.compressFile, "compress-file", false, "Compress the result file (sets result_options.compress_file)")
+	cc.cmd.Flags().BoolVar(&cc.compressFile, "compress-file", false, "Compress the result file. Equivalent to the API parameter result_options.compress_file; the raw form is --result_options[compress_file]=true.")
+	// Hidden alias so the bracket form from the API docs is accepted (pflag
+	// treats --result_options[compress_file] as a flag name).
+	cc.cmd.Flags().BoolVar(&cc.compressFile, "result_options[compress_file]", false, "")
+	cc.cmd.Flags().MarkHidden("result_options[compress_file]") // #nosec G104
+
+	cc.cmd.SetFlagErrorFunc(flagErrorWithNestedAPIHint)
 
 	cc.cmd.Flags().BoolVar(&cc.rb.DryRun, "dry-run", false, "Preview the request without sending it")
-	cc.cmd.Flags().BoolVarP(&cc.rb.Livemode, "live", "", false, "Make a live request (default: test)")
+	cc.cmd.Flags().BoolVarP(&cc.rb.Livemode, "live", "", false, "Make a live request (default: test). Requires that you're logged in to live mode — check with 'stripe whoami', switch with 'stripe switch'")
 	cc.cmd.Flags().BoolVarP(&cc.rb.DarkStyle, "dark-style", "", false, "Use a darker color scheme better suited for lighter command-lines")
 
 	cc.cmd.Flags().StringVar(&cc.rb.APIBaseURL, "api-base", stripe.DefaultAPIBaseURL, "Sets the API base URL")
@@ -135,21 +142,21 @@ func newReportingQueryRunsRetrieveCmd() *reportingQueryRunsRetrieveCmd {
 
 	rc.cmd = &cobra.Command{
 		Use:   "retrieve <id>",
-		Short: "Retrieve a query run",
+		Short: "Retrieve a query run (Public Preview)",
 		Long: `Retrieve a query run by its id to check its status and fetch results.
 
-Sends a GET request to /v2/data/reporting/query_runs/{id}. This is a preview
-API — the Stripe-Version preview header is set automatically.
+Sends a GET request to /v2/data/reporting/query_runs/{id}. This is a
+Public Preview API — the Stripe-Version preview header is set automatically.
 
 Once the query run's status is "succeeded", the result's download_url can be
 used to download the query output.`,
-		Example: `  # Retrieve a query run
-  stripe reporting query-runs retrieve qryrun_test_123`,
+		Example: `  # Retrieve a query run (replace <query_run_id> with an id from create)
+  stripe reporting query-runs retrieve <query_run_id>`,
 		Args: validators.ExactArgs(1),
 		RunE: rc.runReportingQueryRunsRetrieveCmd,
 	}
 
-	rc.cmd.Flags().BoolVarP(&rc.rb.Livemode, "live", "", false, "Make a live request (default: test)")
+	rc.cmd.Flags().BoolVarP(&rc.rb.Livemode, "live", "", false, "Make a live request (default: test). Requires that you're logged in to live mode — check with 'stripe whoami', switch with 'stripe switch'")
 	rc.cmd.Flags().BoolVarP(&rc.rb.DarkStyle, "dark-style", "", false, "Use a darker color scheme better suited for lighter command-lines")
 
 	rc.cmd.Flags().StringVar(&rc.rb.APIBaseURL, "api-base", stripe.DefaultAPIBaseURL, "Sets the API base URL")
@@ -242,13 +249,17 @@ func (rc *reportingQueryRunsRetrieveCmd) runReportingQueryRunsRetrieveCmd(cmd *c
 	if err := stripe.ValidateAPIBaseURL(rc.rb.APIBaseURL); err != nil {
 		return err
 	}
+	segment, err := stripe.EscapePathSegment(args[0])
+	if err != nil {
+		return err
+	}
 
 	creds, err := rc.rb.ResolveCredentials()
 	if err != nil {
 		return err
 	}
 
-	path := queryRunsPath + "/" + url.PathEscape(args[0])
+	path := queryRunsPath + "/" + segment
 
 	_, err = rc.rb.MakeRequest(cmd.Context(), creds, path, &requests.RequestParameters{}, nil, true, nil)
 	return err

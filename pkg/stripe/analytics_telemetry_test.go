@@ -2,10 +2,13 @@ package stripe_test
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
+	"sync"
 	"testing"
 
 	"github.com/spf13/cobra"
@@ -195,6 +198,98 @@ func TestSendEvent(t *testing.T) {
 	processCtx := stripe.WithEventMetadata(context.Background(), telemetryMetadata)
 	analyticsClient := stripe.AnalyticsTelemetryClient{BaseURL: baseURL, HTTPClient: &http.Client{}}
 	analyticsClient.SendEvent(processCtx, "foo", "bar")
+}
+
+func TestHTTPOutcomeForStatusCode(t *testing.T) {
+	for _, test := range []struct {
+		status int
+		want   string
+	}{
+		{status: -1, want: ""},
+		{status: 0, want: ""},
+		{status: 100, want: "other_non_200"},
+		{status: 199, want: "other_non_200"},
+		{status: 200, want: "2xx"},
+		{status: 201, want: "2xx"},
+		{status: 204, want: "2xx"},
+		{status: 299, want: "2xx"},
+		{status: 300, want: "other_non_200"},
+		{status: 302, want: "other_non_200"},
+		{status: 399, want: "other_non_200"},
+		{status: 400, want: "other_4xx"},
+		{status: 401, want: "other_4xx"},
+		{status: 403, want: "other_4xx"},
+		{status: 404, want: "not_found"},
+		{status: 429, want: "other_4xx"},
+		{status: 499, want: "other_4xx"},
+		{status: 500, want: "5xx"},
+		{status: 599, want: "5xx"},
+		{status: 600, want: "other_non_200"},
+	} {
+		t.Run(fmt.Sprint(test.status), func(t *testing.T) {
+			require.Equal(t, test.want, stripe.HTTPOutcomeForStatusCode(test.status))
+		})
+	}
+}
+
+func TestSendAPIRequestEvent_HTTPOutcome(t *testing.T) {
+	for _, status := range []int{0, 200, 201, 204, 302, 400, 401, 403, 404, 429, 500} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			forms := make(chan url.Values, 1)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if err := r.ParseForm(); err != nil {
+					t.Error(err)
+				}
+				forms <- r.PostForm
+			}))
+			defer server.Close()
+			baseURL, err := url.Parse(server.URL)
+			require.NoError(t, err)
+			client := stripe.AnalyticsTelemetryClient{BaseURL: baseURL, HTTPClient: server.Client()}
+			outcome := stripe.HTTPOutcomeForStatusCode(status)
+			metadata := &stripe.CLIAnalyticsEventMetadata{CommandPath: "stripe get", HTTPOutcome: outcome}
+			ctx := stripe.WithEventMetadata(context.Background(), metadata)
+
+			resp, err := client.SendAPIRequestEvent(ctx, "", false)
+			require.NoError(t, err)
+			require.NoError(t, resp.Body.Close())
+
+			form := <-forms
+			require.Equal(t, "API Request", form.Get("event_name"))
+			require.Equal(t, outcome, form.Get("http_outcome"))
+			require.Equal(t, outcome != "", form.Has("http_outcome"))
+			require.False(t, form.Has("http_status_code"))
+		})
+	}
+}
+
+func TestSendEvent_HTTPOutcome(t *testing.T) {
+	for _, outcome := range []string{"", "not_found", "other_4xx", "5xx", "other_non_200"} {
+		t.Run("outcome="+outcome, func(t *testing.T) {
+			forms := make(chan url.Values, 1)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if err := r.ParseForm(); err != nil {
+					t.Error(err)
+				}
+				forms <- r.PostForm
+			}))
+			defer server.Close()
+			baseURL, err := url.Parse(server.URL)
+			require.NoError(t, err)
+			client := stripe.AnalyticsTelemetryClient{BaseURL: baseURL, HTTPClient: server.Client()}
+			metadata := &stripe.CLIAnalyticsEventMetadata{CommandPath: "get", HTTPOutcome: outcome}
+			ctx := stripe.WithEventMetadata(context.Background(), metadata)
+
+			client.SendEvent(ctx, "CLI Error", "api")
+
+			form := <-forms
+			require.Equal(t, "CLI Error", form.Get("event_name"))
+			require.Equal(t, "api", form.Get("event_value"))
+			require.Equal(t, outcome, form.Get("http_outcome"))
+			require.Equal(t, outcome != "", form.Has("http_outcome"))
+			require.False(t, form.Has("http_status_code"))
+		})
+	}
 }
 
 func TestSendEvent_WithAIAgent(t *testing.T) {
@@ -408,4 +503,87 @@ func TestNewEventMetadata_ReportsRawHostWhenUncategorized(t *testing.T) {
 	tel := stripe.NewEventMetadata()
 	require.Equal(t, "other", tel.AgentHostKind)
 	require.Equal(t, "some-future-surface", tel.AgentHostRaw)
+}
+
+func TestNewEventMetadata_InfersCodexTerminalFromAbsentOriginator(t *testing.T) {
+	// Codex sets its originator override only from non-default surfaces, so a terminal
+	// session reports no host at all. Without the inference this is indistinguishable
+	// from a CLI too old to report a host, and terminal Codex is invisible.
+	clearAgentEnv(t)
+	t.Setenv("CODEX_SANDBOX", "1")
+
+	tel := stripe.NewEventMetadata()
+	require.Equal(t, "codex_cli", tel.AIAgent)
+	require.Equal(t, "terminal", tel.AgentHostKind)
+	require.Equal(t, "codex-cli", tel.AgentHostRaw)
+}
+
+func TestNewEventMetadata_InfersAgentFromHostAlone(t *testing.T) {
+	// A Claude Code entrypoint with no CLAUDECODE: hosted and SDK surfaces do not always
+	// set it. The entrypoint names the agent, so the two fields stay consistent.
+	clearAgentEnv(t)
+	t.Setenv("CLAUDE_CODE_ENTRYPOINT", "remote-trigger")
+
+	tel := stripe.NewEventMetadata()
+	require.Equal(t, "claude_code", tel.AIAgent)
+	require.Equal(t, "remote", tel.AgentHostKind)
+	require.Equal(t, "remote-trigger", tel.AgentHostRaw)
+}
+
+func TestNewEventMetadata_CategorizesCodexVSCode(t *testing.T) {
+	clearAgentEnv(t)
+	t.Setenv("CODEX_CI", "1")
+	t.Setenv("CODEX_INTERNAL_ORIGINATOR_OVERRIDE", "codex_vscode")
+
+	tel := stripe.NewEventMetadata()
+	require.Equal(t, "codex_cli", tel.AIAgent)
+	require.Equal(t, "ide", tel.AgentHostKind)
+	require.Equal(t, "codex-vscode", tel.AgentHostRaw)
+}
+
+type recordingRoundTripper struct {
+	mu   sync.Mutex
+	urls []string
+}
+
+func (r *recordingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	r.mu.Lock()
+	r.urls = append(r.urls, req.URL.String())
+	r.mu.Unlock()
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader("")),
+		Header:     make(http.Header),
+		Request:    req,
+	}, nil
+}
+
+func TestConcurrentSendsWithDefaultBaseURL(t *testing.T) {
+	rt := &recordingRoundTripper{}
+	client := &stripe.AnalyticsTelemetryClient{HTTPClient: &http.Client{Transport: rt}}
+	ctx := stripe.WithEventMetadata(context.Background(), stripe.NewEventMetadata())
+
+	const n = 8
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			client.SendEvent(ctx, "Command Invoked", "")
+		}()
+		go func() {
+			defer wg.Done()
+			resp, err := client.SendAPIRequestEvent(ctx, "req_123", false)
+			if err == nil && resp != nil {
+				resp.Body.Close()
+			}
+		}()
+	}
+	wg.Wait()
+
+	require.Len(t, rt.urls, 2*n)
+	for _, u := range rt.urls {
+		require.Equal(t, stripe.DefaultTelemetryEndpoint, u)
+	}
+	require.Nil(t, client.BaseURL)
 }

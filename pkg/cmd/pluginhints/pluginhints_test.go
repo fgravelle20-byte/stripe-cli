@@ -4,41 +4,84 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	log "github.com/sirupsen/logrus"
+	"github.com/spf13/afero"
 	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/stripe/stripe-cli/pkg/config"
+	"github.com/stripe/stripe-cli/pkg/errorcategory"
+	"github.com/stripe/stripe-cli/pkg/keyring"
 	"github.com/stripe/stripe-cli/pkg/login"
+	"github.com/stripe/stripe-cli/pkg/plugins"
+	"github.com/stripe/stripe-cli/pkg/requests"
+	"github.com/stripe/stripe-cli/pkg/validators"
 )
+
+// pluginFound and pluginAutoInstallable stand in for the metadata lookup. The
+// resolved version carries the backend's per-plugin auto-install setting.
+func pluginFound(context.Context) (*plugins.ResolvedPluginVersion, error) {
+	return &plugins.ResolvedPluginVersion{}, nil
+}
+
+func pluginAutoInstallable(context.Context) (*plugins.ResolvedPluginVersion, error) {
+	return &plugins.ResolvedPluginVersion{AutoInstall: true}, nil
+}
+
+// pluginLookupFails stands in for a lookup that could not reach an answer at all.
+func pluginLookupFails(message string) pluginResolver {
+	return func(context.Context) (*plugins.ResolvedPluginVersion, error) {
+		return nil, errors.New(message)
+	}
+}
 
 // newTestCmd builds a pluginHintCmd with all side effects mocked out.
 // By default accountIDFn reports a logged-in account; override in tests that
 // need to simulate an unauthenticated user.
 func newTestCmd(name string, opts ...option) *pluginHintCmd {
-	p := &pluginHintCmd{
-		name:          name,
-		description:   "Test description.",
-		stdout:        &bytes.Buffer{},
-		stdin:         strings.NewReader(""),
-		accountIDFn:   func() (string, error) { return "acct_test", nil },
-		loginFn:       func(ctx context.Context) error { return nil },
-		accessBaseURL: login.DefaultAccessBaseURL,
-	}
-	for _, opt := range opts {
-		opt(p)
-	}
-	p.Command = &cobra.Command{Use: name, RunE: p.run}
+	return newTestCmdWithRunner(name, nil, opts...)
+}
+
+func newTestCmdWithRunner(name string, runPlugin PluginRunner, opts ...option) *pluginHintCmd {
+	p := newPluginHintCmd(&config.Config{}, name, "Test description.", runPlugin, opts...)
+	p.stdout = &bytes.Buffer{}
+	p.stderr = &bytes.Buffer{}
+	p.stdin = strings.NewReader("\n")
+	p.stdinIsTerminal = func() bool { return true }
+	p.accountIDFn = func() (string, error) { return "acct_test", nil }
+	p.loginFn = func(ctx context.Context) error { return nil }
+	p.argvFn = func() []string { return []string{"stripe", name} }
+	p.lookupEnvFn = func(string) string { return "" }
+	// Fail immediately if a test forgets to mock a side effect.
+	p.lookupFn = pluginLookupFails("unexpected metadata lookup")
+	p.installFn = func(context.Context) error { return errors.New("unexpected install") }
+	// The host normally points Cobra at stdout; do the same so help rendered by
+	// Cobra lands in the same buffer as this command's own output.
+	p.SetOut(p.stdout)
 	return p
 }
 
 func (p *pluginHintCmd) output() string {
 	return p.stdout.(*bytes.Buffer).String()
+}
+
+// errOutput returns what the command wrote to stderr, which is where the
+// non-interactive auto-install path reports progress and next steps.
+func (p *pluginHintCmd) errOutput() string {
+	return p.stderr.(*bytes.Buffer).String()
 }
 
 func findChildCommand(rootCmd *cobra.Command, name string) *cobra.Command {
@@ -50,12 +93,138 @@ func findChildCommand(rootCmd *cobra.Command, name string) *cobra.Command {
 	return nil
 }
 
+type failOnRead struct{ t *testing.T }
+
+func (r failOnRead) Read([]byte) (int, error) {
+	r.t.Fatal("recovery must not read stdin")
+	return 0, io.EOF
+}
+
+func TestRun_MissingCredentialsDiscoveryFailures(t *testing.T) {
+	t.Setenv("STRIPE_API_KEY", "")
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	cfg := &config.Config{LogLevel: "info", Color: "auto", ProfilesFile: filepath.Join(t.TempDir(), "config.toml")}
+	cfg.InitConfig()
+	defer viper.Reset()
+	cfg.Profile.AccountID = "saved-account"
+	oldKeyring := config.KeyRing
+	config.KeyRing = keyring.NewMemoryStore(nil)
+	t.Cleanup(func() { config.KeyRing = oldKeyring })
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/ajax/stripecli/plugins_metadata", r.URL.Path)
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = io.WriteString(w, `{"error":{"message":"discovery response details"}}`)
+	}))
+	defer server.Close()
+	failingServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, `{"error":{"message":"metadata unavailable"}}`)
+	}))
+	defer failingServer.Close()
+	closedServer := httptest.NewServer(http.NotFoundHandler())
+	closedServer.Close()
+
+	for _, name := range []string{"headless not found", "agent not found", "transport", "server", "cancellation"} {
+		t.Run(name, func(t *testing.T) {
+			baseURL := server.URL
+			switch name {
+			case "transport":
+				baseURL = closedServer.URL
+			case "server":
+				baseURL = failingServer.URL
+			}
+			fs := afero.NewMemMapFs()
+			if name == "headless not found" {
+				cachePath := filepath.Join(cfg.GetConfigFolder(os.Getenv("XDG_CONFIG_HOME")), "plugins.toml")
+				require.NoError(t, fs.MkdirAll(filepath.Dir(cachePath), 0755))
+				require.NoError(t, afero.WriteFile(fs, cachePath, []byte("[[Plugin]]\nShortname = \"another-plugin\"\nBinary = \"stripe-cli-another-plugin\"\n"), 0600))
+			}
+			p := newTestCmd("example")
+			p.lookupFn = func(ctx context.Context) (*plugins.ResolvedPluginVersion, error) {
+				return plugins.ResolvePluginForInstall(ctx, cfg, fs, "example", "", baseURL, baseURL)
+			}
+			p.stdinIsTerminal = func() bool { return name != "headless not found" }
+			p.lookupEnvFn = func(key string) string {
+				if name == "agent not found" && key == "CLAUDECODE" {
+					return "1"
+				}
+				return ""
+			}
+			p.stdin = failOnRead{t}
+			p.loginFn = func(context.Context) error { t.Fatal("unexpected login"); return nil }
+			p.openBrowserFn = func(string) error { t.Fatal("unexpected browser"); return nil }
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if name == "cancellation" {
+				cancel()
+			}
+			p.SetContext(ctx)
+			err := p.run(p.Command, nil)
+			switch name {
+			case "transport":
+				var transportErr *url.Error
+				require.ErrorAs(t, err, &transportErr)
+			case "server":
+				var requestErr requests.RequestError
+				require.ErrorAs(t, err, &requestErr)
+				require.Equal(t, http.StatusInternalServerError, requestErr.StatusCode)
+			case "cancellation":
+				require.ErrorIs(t, err, context.Canceled)
+			default:
+				require.ErrorIs(t, err, validators.ErrAPIKeyNotConfigured)
+				category, ok := errorcategory.Get(err)
+				require.True(t, ok)
+				require.Equal(t, errorcategory.Auth, category)
+				require.EqualError(t, err, "You're not logged in.\nRun 'stripe login', check the account with 'stripe whoami', then retry 'stripe plugin install example'.")
+				var notFound *plugins.ErrPluginNotFound
+				require.ErrorAs(t, err, &notFound)
+				require.Equal(t, "example", notFound.Name)
+				var requestErr requests.RequestError
+				require.ErrorAs(t, err, &requestErr)
+				require.Equal(t, http.StatusNotFound, requestErr.StatusCode)
+				require.Contains(t, requestErr.Error(), "discovery response details")
+				require.Empty(t, p.output())
+				require.Empty(t, p.errOutput())
+				return
+			}
+			require.NotErrorIs(t, err, validators.ErrAPIKeyNotConfigured)
+			require.NotContains(t, err.Error(), "stripe login")
+			require.Empty(t, p.output())
+			require.Empty(t, p.errOutput())
+		})
+	}
+}
+
+func TestPromptLogin_EOFDoesNotConsent(t *testing.T) {
+	p := newTestCmd("example")
+	p.stdin = strings.NewReader("")
+	p.loginFn = func(context.Context) error { t.Fatal("unexpected login"); return nil }
+	err := p.offerLogin(context.Background(), validators.ErrAPIKeyNotConfigured)
+	require.EqualError(t, err, "login canceled")
+}
+
+func TestRun_PreservesLookupFailure(t *testing.T) {
+	for _, cause := range []error{
+		errors.New("session refresh failed"),
+		requests.RequestError{StatusCode: http.StatusUnauthorized},
+		&url.Error{Op: "Get", URL: "http://example.test", Err: errors.New("connection refused")},
+	} {
+		p := newAutoInstallTestCmd("example")
+		p.lookupFn = func(context.Context) (*plugins.ResolvedPluginVersion, error) { return nil, cause }
+		p.stdin = failOnRead{t}
+		p.loginFn = func(context.Context) error { t.Fatal("unexpected login"); return nil }
+		p.installFn = func(context.Context) error { t.Fatal("unexpected install"); return nil }
+		require.ErrorIs(t, p.run(p.Command, nil), cause)
+		require.Empty(t, p.output())
+	}
+}
+
 // --- AddHintCommands ---
 
 func TestAddHintCommands_DirectoryHintRoutesAliasesWhenPluginMissing(t *testing.T) {
 	rootCmd := &cobra.Command{Use: "stripe", Annotations: map[string]string{}}
 
-	AddHintCommands(rootCmd, &config.Config{}, map[string]bool{})
+	AddHintCommands(rootCmd, &config.Config{}, map[string]bool{}, nil)
 
 	directoryCmd := findChildCommand(rootCmd, "directory")
 	require.NotNil(t, directoryCmd)
@@ -82,7 +251,7 @@ func TestAddHintCommands_DirectoryHintSkippedWhenPluginInstalled(t *testing.T) {
 
 	AddHintCommands(rootCmd, &config.Config{}, map[string]bool{
 		"directory": true,
-	})
+	}, nil)
 
 	assert.Nil(t, findChildCommand(rootCmd, "directory"))
 }
@@ -90,9 +259,9 @@ func TestAddHintCommands_DirectoryHintSkippedWhenPluginInstalled(t *testing.T) {
 func TestAddHintCommands_SetsAvailablePluginAnnotations(t *testing.T) {
 	rootCmd := &cobra.Command{Use: "stripe", Annotations: map[string]string{}}
 
-	AddHintCommands(rootCmd, &config.Config{}, map[string]bool{})
+	AddHintCommands(rootCmd, &config.Config{}, map[string]bool{}, nil)
 
-	for _, name := range []string{"apps", "generate", "projects", "directory", "tools"} {
+	for _, name := range []string{"apps", "generate", "projects", "pay", "directory", "tools"} {
 		t.Run(name, func(t *testing.T) {
 			assert.Equal(t, "available_plugin", rootCmd.Annotations[name])
 		})
@@ -105,13 +274,59 @@ func TestAddHintCommands_NoAnnotationWhenPluginInstalled(t *testing.T) {
 	AddHintCommands(rootCmd, &config.Config{}, map[string]bool{
 		"tools": true,
 		"apps":  true,
-	})
+		"pay":   true,
+	}, nil)
 
 	assert.Empty(t, rootCmd.Annotations["tools"])
 	assert.Empty(t, rootCmd.Annotations["apps"])
+	assert.Empty(t, rootCmd.Annotations["pay"])
 	assert.Equal(t, "available_plugin", rootCmd.Annotations["generate"])
 	assert.Equal(t, "available_plugin", rootCmd.Annotations["projects"])
 	assert.Equal(t, "available_plugin", rootCmd.Annotations["directory"])
+}
+
+// --- resolveOnce ---
+
+// TestResolveOnce_AsksTheEndpointOncePerInvocation pins the reason resolveOnce
+// exists: deciding whether to install and then installing both need the resolution,
+// and each extra call would be another metadata request on a user's first use of a
+// plugin.
+func TestResolveOnce_AsksTheEndpointOncePerInvocation(t *testing.T) {
+	calls := 0
+	want := &plugins.ResolvedPluginVersion{Version: "1.2.3", AutoInstall: true}
+	resolve := resolveOnce(func(context.Context) (*plugins.ResolvedPluginVersion, error) {
+		calls++
+		return want, nil
+	})
+
+	first, err := resolve(context.Background())
+	require.NoError(t, err)
+	second, err := resolve(context.Background())
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, calls)
+	// The same resolution, not an equal copy: the install path acts on what the
+	// decision was made about.
+	assert.Same(t, want, first)
+	assert.Same(t, want, second)
+}
+
+// TestResolveOnce_ReusesFailures keeps a failed lookup from silently turning into a
+// retry, which would put a second request back on the path this removed it from.
+func TestResolveOnce_ReusesFailures(t *testing.T) {
+	calls := 0
+	resolve := resolveOnce(func(context.Context) (*plugins.ResolvedPluginVersion, error) {
+		calls++
+		return nil, errors.New("no metadata")
+	})
+
+	_, firstErr := resolve(context.Background())
+	resolved, secondErr := resolve(context.Background())
+
+	assert.Equal(t, 1, calls)
+	assert.EqualError(t, firstErr, "no metadata")
+	assert.EqualError(t, secondErr, "no metadata")
+	assert.Nil(t, resolved)
 }
 
 // --- run ---
@@ -119,7 +334,7 @@ func TestAddHintCommands_NoAnnotationWhenPluginInstalled(t *testing.T) {
 func TestRun_PluginFound_CallsPromptInstall(t *testing.T) {
 	p := newTestCmd("generate", withPrivatePreview())
 	installCalled := false
-	p.lookupFn = func(ctx context.Context) error { return nil }
+	p.lookupFn = pluginFound
 	p.installFn = func(ctx context.Context) error { installCalled = true; return nil }
 
 	err := p.run(p.Command, nil)
@@ -129,20 +344,37 @@ func TestRun_PluginFound_CallsPromptInstall(t *testing.T) {
 	assert.Contains(t, p.output(), "The \"generate\" plugin is required")
 }
 
-func TestRun_PluginNotFound_PrivatePreviewFalse_LoggedIn_PrintsInstallHint(t *testing.T) {
-	p := newTestCmd("apps") // accountIDFn returns "acct_test" by default
-	p.lookupFn = func(ctx context.Context) error { return errors.New("not found") }
+func TestRun_PluginNotFound_CredentialsAvailable(t *testing.T) {
+	p := newTestCmd("apps")
+	p.lookupFn = func(context.Context) (*plugins.ResolvedPluginVersion, error) {
+		return nil, &plugins.ErrPluginNotFound{Name: "apps"}
+	}
 
 	err := p.run(p.Command, nil)
 
-	require.NoError(t, err)
-	assert.Contains(t, p.output(), "stripe plugin install apps")
+	require.ErrorContains(t, err, "could not find an available release")
+	assert.Contains(t, err.Error(), "plugin name")
+	assert.Contains(t, err.Error(), "stripe whoami")
+	assert.Contains(t, err.Error(), "active account")
 }
 
-func TestRun_PluginNotFound_PrivatePreviewFalse_NotLoggedIn_PromptsLogin(t *testing.T) {
+func TestRun_MissingCredentials_OffersLoginDespiteSavedAccount(t *testing.T) {
+	var debugOutput bytes.Buffer
+	logger := log.StandardLogger()
+	oldOutput, oldLevel := logger.Out, logger.GetLevel()
+	logger.SetOutput(&debugOutput)
+	logger.SetLevel(log.DebugLevel)
+	t.Cleanup(func() {
+		logger.SetOutput(oldOutput)
+		logger.SetLevel(oldLevel)
+	})
+
 	p := newTestCmd("docs")
-	p.lookupFn = func(ctx context.Context) error { return errors.New("not found") }
-	p.accountIDFn = func() (string, error) { return "", nil }
+	cause := fmt.Errorf("anonymous lookup failed: %w: %w", validators.ErrAPIKeyNotConfigured,
+		requests.RequestError{StatusCode: http.StatusNotFound, Body: "discovery response details"})
+	p.lookupFn = func(context.Context) (*plugins.ResolvedPluginVersion, error) {
+		return nil, cause
+	}
 	loginCalled := false
 	p.loginFn = func(ctx context.Context) error { loginCalled = true; return nil }
 
@@ -150,23 +382,11 @@ func TestRun_PluginNotFound_PrivatePreviewFalse_NotLoggedIn_PromptsLogin(t *test
 
 	require.NoError(t, err)
 	assert.True(t, loginCalled)
-	assert.Contains(t, p.output(), "stripe login")
-	assert.NotContains(t, p.output(), "stripe plugin install")
-}
-
-func TestRun_PluginNotFound_PrivatePreviewFalse_AccountIDError_PromptsLogin(t *testing.T) {
-	p := newTestCmd("docs")
-	p.lookupFn = func(ctx context.Context) error { return errors.New("not found") }
-	p.accountIDFn = func() (string, error) { return "", errors.New("not configured") }
-	loginCalled := false
-	p.loginFn = func(ctx context.Context) error { loginCalled = true; return nil }
-
-	err := p.run(p.Command, nil)
-
-	require.NoError(t, err)
-	assert.True(t, loginCalled)
-	assert.Contains(t, p.output(), "stripe login")
-	assert.NotContains(t, p.output(), "stripe plugin install")
+	assert.Equal(t, "You're not logged in.\nRun 'stripe login', check the account with 'stripe whoami', then retry 'stripe plugin install docs'.\n\n"+
+		"Press Enter to run 'stripe login', or type anything to cancel: "+
+		"Run 'stripe whoami' to verify the active account before retrying your command.\n", p.output())
+	assert.Contains(t, debugOutput.String(), cause.Error())
+	assert.Empty(t, p.errOutput())
 }
 
 func TestRun_PluginNotFound_PrivatePreviewTrue_ExitsWithOne(t *testing.T) {
@@ -179,9 +399,12 @@ func TestRun_PluginNotFound_PrivatePreviewTrue_ExitsWithOne(t *testing.T) {
 			stdout:         os.Stdout,
 			stdin:          strings.NewReader(""),
 			accessBaseURL:  login.DefaultAccessBaseURL,
+			lookupEnvFn:    func(string) string { return "" },
 		}
 		p.Command = &cobra.Command{Use: "generate", RunE: p.run}
-		p.lookupFn = func(ctx context.Context) error { return errors.New("not found") }
+		p.lookupFn = func(context.Context) (*plugins.ResolvedPluginVersion, error) {
+			return nil, &plugins.ErrPluginNotFound{Name: "generate"}
+		}
 		p.accountIDFn = func() (string, error) { return "acct_123", nil }
 		p.run(p.Command, nil) //nolint:errcheck
 		return
@@ -199,6 +422,713 @@ func TestRun_PluginNotFound_PrivatePreviewTrue_ExitsWithOne(t *testing.T) {
 	assert.Equal(t, 1, exitErr.ExitCode())
 	assert.Contains(t, stdout.String(), "private preview")
 	assert.Contains(t, stdout.String(), "acct_123")
+}
+
+// --- auto-install ---
+
+// runViaCobra executes p through a root command so Cobra resolves aliases and
+// records CalledAs the way it does during a real invocation. argv stands in for
+// os.Args, so it includes the binary name.
+func runViaCobra(t *testing.T, p *pluginHintCmd, aliases []string, argv []string) error {
+	t.Helper()
+
+	p.argvFn = func() []string { return argv }
+	p.Aliases = aliases
+	p.SilenceUsage = true
+	p.SilenceErrors = true
+
+	root := &cobra.Command{Use: "stripe", SilenceUsage: true, SilenceErrors: true}
+	// Stand in for the host's persistent flags, which Cobra consumes before RunE.
+	root.PersistentFlags().String("log-level", "", "")
+	root.PersistentFlags().StringP("project-name", "p", "", "")
+	root.AddCommand(p.Command)
+	root.SetArgs(argv[1:])
+	root.SetOut(p.stdout)
+	root.SetErr(p.stdout)
+
+	return root.Execute()
+}
+
+// newAutoInstallTestCmd builds a command whose metadata lookup reports that the
+// backend has enabled auto-install for the plugin.
+func newAutoInstallTestCmd(name string, opts ...option) *pluginHintCmd {
+	p := newTestCmd(name, opts...)
+	p.lookupFn = pluginAutoInstallable
+	p.installFn = func(ctx context.Context) error { return nil }
+	return p
+}
+
+func TestRun_AutoInstall_InstallsAndRunsWithoutPrompting(t *testing.T) {
+	p := newAutoInstallTestCmd("directory")
+	installCalled := false
+	p.installFn = func(ctx context.Context) error { installCalled = true; return nil }
+	var ranWith []string
+	p.runPluginFn = func(cmd *cobra.Command, args []string) error { ranWith = args; return nil }
+	// A prompt would consume this; auto-install must leave stdin for the plugin.
+	stdin := strings.NewReader("unread\n")
+	p.stdin = stdin
+
+	err := p.run(p.Command, nil)
+
+	require.NoError(t, err)
+	assert.True(t, installCalled)
+	assert.NotNil(t, ranWith, "expected the plugin to run after installing")
+	assert.Contains(t, p.errOutput(), "one-time setup")
+	assert.NotContains(t, p.output()+p.errOutput(), "press Enter")
+	remaining, readErr := io.ReadAll(stdin)
+	require.NoError(t, readErr)
+	assert.Equal(t, "unread\n", string(remaining))
+}
+
+func TestRun_AutoInstall_ForwardsArgsToPlugin(t *testing.T) {
+	tests := []struct {
+		name     string
+		aliases  []string
+		argv     []string
+		wantArgs []string
+	}{
+		{
+			name:     "canonical name",
+			argv:     []string{"stripe", "directory", "search", "coffee shops"},
+			wantArgs: []string{"search", "coffee shops"},
+		},
+		{
+			name:     "host flags before the plugin name are not forwarded",
+			argv:     []string{"stripe", "--log-level", "debug", "directory", "search", "x"},
+			wantArgs: []string{"search", "x"},
+		},
+		{
+			name:     "plugin flags after the plugin name are forwarded",
+			argv:     []string{"stripe", "directory", "search", "x", "--limit", "5"},
+			wantArgs: []string{"search", "x", "--limit", "5"},
+		},
+		{
+			name:     "profile value matching the plugin name is not the command",
+			argv:     []string{"stripe", "--project-name", "directory", "directory", "search", "directory"},
+			wantArgs: []string{"search", "directory"},
+		},
+		{
+			name:     "short profile flag with a separate value",
+			argv:     []string{"stripe", "-p", "directory", "directory", "search"},
+			wantArgs: []string{"search"},
+		},
+		{
+			name:     "short profile flag with an attached value",
+			argv:     []string{"stripe", "-pdirectory", "directory", "search"},
+			wantArgs: []string{"search"},
+		},
+		{
+			name:     "bare invocation forwards no args",
+			argv:     []string{"stripe", "directory"},
+			wantArgs: []string{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := newAutoInstallTestCmd("directory")
+			var ranWith []string
+			p.runPluginFn = func(cmd *cobra.Command, args []string) error { ranWith = args; return nil }
+
+			err := runViaCobra(t, p, tt.aliases, tt.argv)
+
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantArgs, ranWith)
+		})
+	}
+}
+
+// TestRun_AutoInstall_AliasPromptsInsteadOfInstalling pins the rule that fetching a
+// binary without asking requires the plugin's real name. An alias — a typo alias
+// especially — is too weak a signal to act on silently, so it falls back to the same
+// prompt every other not-yet-installed plugin uses.
+func TestRun_AutoInstall_AliasPromptsInsteadOfInstalling(t *testing.T) {
+	tests := []struct {
+		name        string
+		aliases     []string
+		argv        []string
+		wantInstall bool
+	}{
+		{
+			name:        "the real name installs without asking",
+			argv:        []string{"stripe", "directory", "search", "coffee shops"},
+			wantInstall: true,
+		},
+		{
+			name:    "subcommand alias asks first",
+			aliases: []string{"search"},
+			argv:    []string{"stripe", "search", "coffee shops"},
+		},
+		{
+			name:    "typo alias asks first",
+			aliases: []string{"direcotry"},                          //nolint:misspell // Intentional typo alias.
+			argv:    []string{"stripe", "direcotry", "search", "x"}, //nolint:misspell // Intentional typo alias.
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := newAutoInstallTestCmd("directory")
+			// Declining at the prompt is how this test tells the two paths apart:
+			// auto-install never reads stdin.
+			p.stdin = strings.NewReader("no\n")
+			installed := false
+			p.installFn = func(ctx context.Context) error { installed = true; return nil }
+
+			err := runViaCobra(t, p, tt.aliases, tt.argv)
+
+			if tt.wantInstall {
+				require.NoError(t, err)
+				assert.True(t, installed)
+				assert.NotContains(t, p.output(), "press Enter")
+				return
+			}
+
+			assert.EqualError(t, err, "installation canceled")
+			assert.False(t, installed, "an alias must not install without asking")
+			assert.Contains(t, p.output(), "press Enter to install")
+		})
+	}
+}
+
+func TestRun_AutoInstall_InstallErrorSkipsPluginRun(t *testing.T) {
+	p := newAutoInstallTestCmd("directory")
+	p.installFn = func(ctx context.Context) error { return errors.New("install failed") }
+	runCalled := false
+	p.runPluginFn = func(cmd *cobra.Command, args []string) error { runCalled = true; return nil }
+
+	err := p.run(p.Command, nil)
+
+	assert.EqualError(t, err, "install failed")
+	assert.False(t, runCalled)
+}
+
+func TestRun_AutoInstall_PropagatesPluginError(t *testing.T) {
+	p := newAutoInstallTestCmd("directory")
+	p.runPluginFn = func(cmd *cobra.Command, args []string) error { return errors.New("plugin blew up") }
+
+	err := p.run(p.Command, nil)
+
+	assert.EqualError(t, err, "plugin blew up")
+}
+
+func TestRun_AutoInstall_PrintsNextStepsBeforeRunningPlugin(t *testing.T) {
+	p := newAutoInstallTestCmd("directory")
+	var errOutputAtRunTime string
+	p.runPluginFn = func(cmd *cobra.Command, args []string) error {
+		errOutputAtRunTime = p.errOutput()
+		return nil
+	}
+
+	err := p.run(p.Command, nil)
+
+	require.NoError(t, err)
+	// Captured before the plugin produced any output, so the tips cannot be
+	// mistaken for part of the command's result.
+	assert.Contains(t, errOutputAtRunTime, "installation complete")
+	assert.Contains(t, errOutputAtRunTime, "stripe directory search")
+	assert.Contains(t, errOutputAtRunTime, "directory@stripe.com")
+}
+
+// TestRun_AutoInstall_LeavesStdoutToThePlugin protects the first-run experience for
+// anything parsing the output: installing on demand must not prepend human-readable
+// setup chatter to the stream the plugin's own result arrives on.
+func TestRun_AutoInstall_LeavesStdoutToThePlugin(t *testing.T) {
+	p := newAutoInstallTestCmd("directory")
+	var stdoutAtRunTime string
+	p.runPluginFn = func(cmd *cobra.Command, args []string) error {
+		stdoutAtRunTime = p.output()
+		fmt.Fprintln(p.stdout, `{"results":[]}`)
+		return nil
+	}
+
+	err := p.run(p.Command, nil)
+
+	require.NoError(t, err)
+	assert.Empty(t, stdoutAtRunTime, "stdout must be untouched when the plugin takes over")
+	assert.Equal(t, "{\"results\":[]}\n", p.output())
+	// The guidance still has to reach the user, just not on stdout.
+	assert.Contains(t, p.errOutput(), "installation complete")
+}
+
+func TestRun_AutoInstall_NoRunnerPrintsNextSteps(t *testing.T) {
+	p := newAutoInstallTestCmd("directory")
+	installCalled := false
+	p.installFn = func(ctx context.Context) error { installCalled = true; return nil }
+
+	err := p.run(p.Command, nil)
+
+	require.NoError(t, err)
+	assert.True(t, installCalled)
+	assert.Contains(t, p.errOutput(), "installation complete")
+	assert.Contains(t, p.errOutput(), "directory@stripe.com")
+}
+
+func TestRun_AutoInstall_OptedOutDoesNotInstallOrPrompt(t *testing.T) {
+	for _, name := range []string{"directory", "apps", "generate", "projects", "pay", "tools"} {
+		for _, value := range []string{"1", "true", "TRUE"} {
+			t.Run(name+"/"+value, func(t *testing.T) {
+				p := newAutoInstallTestCmd(name)
+				p.lookupEnvFn = func(key string) string {
+					if key == AutoInstallOptOutEnvVar {
+						return value
+					}
+					return ""
+				}
+				lookupCalled := false
+				p.lookupFn = func(ctx context.Context) (*plugins.ResolvedPluginVersion, error) {
+					lookupCalled = true
+					return nil, errors.New("lookup unavailable")
+				}
+				p.accountIDFn = func() (string, error) { return "", nil }
+				installCalled := false
+				p.installFn = func(ctx context.Context) error { installCalled = true; return nil }
+				runCalled := false
+				p.runPluginFn = func(cmd *cobra.Command, args []string) error { runCalled = true; return nil }
+				loginCalled := false
+				p.loginFn = func(ctx context.Context) error { loginCalled = true; return nil }
+				stdin := strings.NewReader("unread\n")
+				p.stdin = stdin
+
+				err := p.run(p.Command, nil)
+
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), "stripe plugin install "+name)
+				assert.Contains(t, err.Error(), AutoInstallOptOutEnvVar)
+				assert.False(t, lookupCalled)
+				assert.False(t, installCalled)
+				assert.False(t, runCalled)
+				assert.False(t, loginCalled)
+				// The host prints the error, so repeating it on either stream would say
+				// the same thing twice.
+				assert.Empty(t, p.output())
+				assert.Empty(t, p.errOutput())
+				remaining, readErr := io.ReadAll(stdin)
+				require.NoError(t, readErr)
+				assert.Equal(t, "unread\n", string(remaining))
+			})
+		}
+	}
+}
+
+func TestRun_AutoInstall_UnsetOrFalsyOptOutStillInstalls(t *testing.T) {
+	for _, value := range []string{"", "0", "false", "nonsense"} {
+		t.Run(value, func(t *testing.T) {
+			p := newAutoInstallTestCmd("directory")
+			p.lookupEnvFn = func(string) string { return value }
+			installCalled := false
+			p.installFn = func(ctx context.Context) error { installCalled = true; return nil }
+			p.runPluginFn = func(cmd *cobra.Command, args []string) error { return nil }
+
+			err := p.run(p.Command, nil)
+
+			require.NoError(t, err)
+			assert.True(t, installCalled)
+		})
+	}
+}
+
+// TestRun_PluginRequiresNewerCLI_ReportsVersionInsteadOfHints covers a lookup that
+// failed for a reason with exactly one fix. The hint and login paths below both read
+// a failed lookup as the plugin being unavailable or the user being logged out, so
+// either would send the user after something that cannot help.
+func TestRun_PluginRequiresNewerCLI_ReportsVersionInsteadOfHints(t *testing.T) {
+	for _, name := range []string{"logged in", "not logged in"} {
+		t.Run(name, func(t *testing.T) {
+			p := newTestCmd("directory")
+			if name == "not logged in" {
+				p.accountIDFn = func() (string, error) { return "", nil }
+			}
+			loginCalled, installCalled := false, false
+			p.loginFn = func(ctx context.Context) error { loginCalled = true; return nil }
+			p.installFn = func(ctx context.Context) error { installCalled = true; return nil }
+			p.lookupFn = func(context.Context) (*plugins.ResolvedPluginVersion, error) {
+				return nil, &plugins.ErrPluginRequiresNewerCLI{
+					Name:           "directory",
+					Version:        "2.0.1",
+					MinCoreVersion: "1.30.0",
+					CoreVersion:    "1.29.0",
+				}
+			}
+
+			err := p.run(p.Command, nil)
+
+			var requiresNewerCLI *plugins.ErrPluginRequiresNewerCLI
+			require.ErrorAs(t, err, &requiresNewerCLI)
+			assert.Equal(t, "1.30.0", requiresNewerCLI.MinCoreVersion)
+			assert.False(t, loginCalled)
+			assert.False(t, installCalled)
+			assert.NotContains(t, p.output(), "stripe plugin install directory")
+			assert.NotContains(t, p.output(), "stripe login")
+		})
+	}
+}
+
+// TestRun_AutoInstall_ServerDecisionGatesInstalling verifies that only an explicit
+// backend opt-in skips the installation prompt.
+func TestRun_AutoInstall_ServerDecisionGatesInstalling(t *testing.T) {
+	tests := []struct {
+		name        string
+		lookupFn    pluginResolver
+		wantInstall bool
+	}{
+		{
+			name:        "backend enabled auto-install",
+			lookupFn:    pluginAutoInstallable,
+			wantInstall: true,
+		},
+		{
+			name:     "backend disabled auto-install",
+			lookupFn: pluginFound,
+		},
+		{
+			// An older server sends no auto_install field at all, which decodes to the
+			// prompting behavior the CLI has always had.
+			name: "server did not answer",
+			lookupFn: func(context.Context) (*plugins.ResolvedPluginVersion, error) {
+				return &plugins.ResolvedPluginVersion{Version: "1.2.3"}, nil
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := newAutoInstallTestCmd("directory")
+			p.lookupFn = tt.lookupFn
+			// Declining at the prompt is how this test tells the two paths apart:
+			// auto-install never reads stdin.
+			p.stdin = strings.NewReader("no\n")
+			installed := false
+			p.installFn = func(ctx context.Context) error { installed = true; return nil }
+			ran := false
+			p.runPluginFn = func(cmd *cobra.Command, args []string) error { ran = true; return nil }
+
+			err := runViaCobra(t, p, nil, []string{"stripe", "directory", "search", "x"})
+
+			if tt.wantInstall {
+				require.NoError(t, err)
+				assert.True(t, installed)
+				assert.True(t, ran)
+				assert.NotContains(t, p.output(), "press Enter")
+				return
+			}
+
+			assert.EqualError(t, err, "installation canceled")
+			assert.False(t, installed, "the backend did not enable auto-install")
+			assert.False(t, ran)
+			assert.Contains(t, p.output(), "press Enter to install")
+		})
+	}
+}
+
+func TestAutoInstall_BackendControlsEveryPlugin(t *testing.T) {
+	for _, name := range []string{"apps", "generate", "projects", "pay", "directory", "tools"} {
+		for _, enabled := range []bool{true, false} {
+			for _, help := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/auto_install=%t/help=%t", name, enabled, help), func(t *testing.T) {
+					installed, ran := false, false
+					pluginArgs := []string{"subcommand", "--format", "json"}
+					if help {
+						pluginArgs = []string{"subcommand", "--help"}
+					}
+					p := newTestCmdWithRunner(name, func(cmd *cobra.Command, pluginName string, args []string) error {
+						assert.True(t, installed)
+						assert.Equal(t, name, pluginName)
+						wantArgs := pluginArgs
+						if help {
+							wantArgs = append(append([]string{}, pluginArgs...), "--help")
+						}
+						assert.Equal(t, wantArgs, args)
+						ran = true
+						return nil
+					}, withPrivatePreview())
+					p.lookupFn = func(context.Context) (*plugins.ResolvedPluginVersion, error) {
+						return &plugins.ResolvedPluginVersion{AutoInstall: enabled}, nil
+					}
+					p.installFn = func(context.Context) error { installed = true; return nil }
+					stdin := strings.NewReader("no\n")
+					p.stdin = stdin
+
+					err := runViaCobra(t, p, nil, append([]string{"stripe", name}, pluginArgs...))
+
+					if !enabled && !help {
+						require.EqualError(t, err, "installation canceled")
+						assert.Contains(t, p.output(), "press Enter to install")
+					} else {
+						require.NoError(t, err)
+						assert.NotContains(t, p.output(), "press Enter")
+						remaining, readErr := io.ReadAll(stdin)
+						require.NoError(t, readErr)
+						assert.Equal(t, "no\n", string(remaining))
+					}
+					assert.Equal(t, enabled, installed)
+					assert.Equal(t, enabled, ran)
+					if !enabled && help {
+						assert.Contains(t, p.output(), "Test description.")
+						assert.Empty(t, p.errOutput())
+					}
+				})
+			}
+		}
+	}
+}
+
+// --- auto-install help ---
+
+func TestHelp_AutoInstall_InstallsAndForwardsHelpToPlugin(t *testing.T) {
+	tests := []struct {
+		name     string
+		aliases  []string
+		argv     []string
+		wantArgs []string
+	}{
+		{
+			name:     "help flag",
+			argv:     []string{"stripe", "directory", "--help"},
+			wantArgs: []string{"--help", "--help"},
+		},
+		{
+			name:     "short help flag is forwarded as typed",
+			argv:     []string{"stripe", "directory", "-h"},
+			wantArgs: []string{"-h", "--help"},
+		},
+		{
+			name:     "help flag on a plugin subcommand",
+			argv:     []string{"stripe", "directory", "search", "--help"},
+			wantArgs: []string{"search", "--help", "--help"},
+		},
+		{
+			name: "help subcommand",
+			argv: []string{"stripe", "help", "directory"},
+			// argv carries no help flag for the plugin to act on, so one is added.
+			wantArgs: []string{"--help"},
+		},
+		{
+			name:     "help subcommand with a plugin subcommand",
+			argv:     []string{"stripe", "help", "directory", "search"},
+			wantArgs: []string{"search", "--help"},
+		},
+		{
+			name:     "help flag with a profile named after the plugin",
+			argv:     []string{"stripe", "--project-name", "directory", "directory", "search", "--help"},
+			wantArgs: []string{"search", "--help", "--help"},
+		},
+		{
+			name:     "help subcommand with a profile named after the plugin",
+			argv:     []string{"stripe", "-p", "directory", "help", "directory", "search"},
+			wantArgs: []string{"search", "--help"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := newAutoInstallTestCmd("directory")
+			installCalled := false
+			p.installFn = func(ctx context.Context) error { installCalled = true; return nil }
+			var ranWith []string
+			p.runPluginFn = func(cmd *cobra.Command, args []string) error { ranWith = args; return nil }
+
+			err := runViaCobra(t, p, tt.aliases, tt.argv)
+
+			require.NoError(t, err)
+			assert.True(t, installCalled)
+			assert.Equal(t, tt.wantArgs, ranWith)
+			// The plugin supplies the help text, so the placeholder's must not appear.
+			assert.NotContains(t, p.output(), "Test description.")
+			assert.Contains(t, p.errOutput(), "one-time setup")
+			assert.Contains(t, p.errOutput(), "directory@stripe.com")
+		})
+	}
+}
+
+func TestHelp_AutoInstall_NeverRunsPluginAction(t *testing.T) {
+	tests := []struct {
+		name string
+		argv []string
+	}{
+		{
+			name: "help flag before the plugin name",
+			argv: []string{"stripe", "--help=true", "apps", "upload"},
+		},
+		{
+			name: "short help flag before the plugin name",
+			argv: []string{"stripe", "-h=true", "apps", "upload"},
+		},
+		{
+			name: "help flag before the plugin name with positional arguments",
+			argv: []string{"stripe", "--help=true", "apps", "upload", "--", "payload"},
+		},
+		{
+			name: "help subcommand with a disabled help flag",
+			argv: []string{"stripe", "help", "apps", "upload", "--help=false"},
+		},
+		{
+			name: "help subcommand with positional arguments",
+			argv: []string{"stripe", "help", "apps", "upload", "--", "payload"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := newAutoInstallTestCmd("apps")
+			helpShown, uploadCalled := false, false
+			p.runPluginFn = func(cmd *cobra.Command, args []string) error {
+				pluginCmd := &cobra.Command{Use: "apps"}
+				pluginCmd.AddCommand(&cobra.Command{
+					Use: "upload",
+					Run: func(cmd *cobra.Command, args []string) { uploadCalled = true },
+				})
+				pluginCmd.SetHelpFunc(func(cmd *cobra.Command, args []string) { helpShown = true })
+				pluginCmd.SetArgs(args)
+				return pluginCmd.Execute()
+			}
+
+			err := runViaCobra(t, p, nil, tt.argv)
+
+			require.NoError(t, err)
+			assert.True(t, helpShown, "the plugin must receive a help request")
+			assert.False(t, uploadCalled, "a help request must never execute the plugin action")
+		})
+	}
+}
+
+// TestHelp_AutoInstall_AliasShowsPlaceholderHelpWithoutInstalling is the help-side
+// half of the rule in TestRun_AutoInstall_AliasPromptsInsteadOfInstalling: asking an
+// alias what it does must not download anything.
+func TestHelp_AutoInstall_AliasShowsPlaceholderHelpWithoutInstalling(t *testing.T) {
+	tests := []struct {
+		name string
+		argv []string
+	}{
+		{name: "help flag on an alias", argv: []string{"stripe", "search", "--help"}},
+		{name: "help subcommand on an alias", argv: []string{"stripe", "help", "search"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := newAutoInstallTestCmd("directory")
+			installCalled := false
+			p.installFn = func(ctx context.Context) error { installCalled = true; return nil }
+			p.runPluginFn = func(cmd *cobra.Command, args []string) error { return nil }
+
+			err := runViaCobra(t, p, []string{"search"}, tt.argv)
+
+			require.NoError(t, err)
+			assert.False(t, installCalled, "help on an alias must not install the plugin")
+			assert.Contains(t, p.output(), "Test description.", "expected the placeholder help")
+			assert.Empty(t, p.errOutput())
+		})
+	}
+}
+
+func TestHelp_AutoInstall_OptedOutShowsPlaceholderHelpWithoutInstalling(t *testing.T) {
+	p := newAutoInstallTestCmd("directory")
+	p.lookupEnvFn = func(string) string { return "1" }
+	installCalled := false
+	p.installFn = func(ctx context.Context) error { installCalled = true; return nil }
+	runCalled := false
+	p.runPluginFn = func(cmd *cobra.Command, args []string) error { runCalled = true; return nil }
+
+	err := runViaCobra(t, p, nil, []string{"stripe", "directory", "--help"})
+
+	require.NoError(t, err)
+	assert.False(t, installCalled)
+	assert.False(t, runCalled)
+	assert.Contains(t, p.output(), "Test description.")
+	assert.Contains(t, p.output(), AutoInstallOptOutEnvVar)
+	assert.Contains(t, p.output(), "stripe plugin install directory")
+	// The env var name is the whole reason here, so it must not be repeated once the
+	// caller has added the install command.
+	assert.Equal(t, 1, strings.Count(p.output(), "stripe plugin install directory"))
+}
+
+func TestHelp_AutoInstall_LookupFailureShowsPlaceholderHelp(t *testing.T) {
+	p := newAutoInstallTestCmd("directory")
+	p.lookupFn = pluginLookupFails("no metadata")
+	installCalled := false
+	p.installFn = func(ctx context.Context) error { installCalled = true; return nil }
+	p.runPluginFn = func(cmd *cobra.Command, args []string) error { return nil }
+
+	err := runViaCobra(t, p, nil, []string{"stripe", "directory", "--help"})
+
+	require.NoError(t, err)
+	assert.False(t, installCalled)
+	assert.Contains(t, p.output(), "Test description.")
+	assert.Contains(t, p.output(), "no metadata")
+}
+
+func TestHelp_AutoInstall_InstallFailureShowsPlaceholderHelp(t *testing.T) {
+	p := newAutoInstallTestCmd("directory")
+	p.installFn = func(ctx context.Context) error { return errors.New("install failed") }
+	runCalled := false
+	p.runPluginFn = func(cmd *cobra.Command, args []string) error { runCalled = true; return nil }
+
+	err := runViaCobra(t, p, nil, []string{"stripe", "directory", "--help"})
+
+	// Cobra's help hook cannot fail, so the user gets the placeholder plus the reason
+	// the plugin's own help is missing.
+	require.NoError(t, err)
+	assert.False(t, runCalled)
+	// Both halves have to survive: the help the user asked for, and why it is only
+	// the placeholder.
+	assert.Contains(t, p.output(), "Test description.")
+	assert.Contains(t, p.output(), "Usage:")
+	assert.Contains(t, p.output(), "install failed")
+	assert.Contains(t, p.output(), "stripe plugin install directory")
+	// The reason has to come after the help text, so it is the last thing on screen
+	// rather than scrolled off above it.
+	assert.Less(t, strings.Index(p.output(), "Usage:"), strings.Index(p.output(), "install failed"))
+}
+
+func TestHelp_AutoInstall_NoRunnerShowsPlaceholderHelpWithoutInstalling(t *testing.T) {
+	p := newAutoInstallTestCmd("directory")
+	installCalled := false
+	p.installFn = func(ctx context.Context) error { installCalled = true; return nil }
+
+	err := runViaCobra(t, p, nil, []string{"stripe", "directory", "--help"})
+
+	require.NoError(t, err)
+	assert.False(t, installCalled)
+	assert.Contains(t, p.output(), "Test description.")
+	// Nothing was attempted, so there is no gap to explain.
+	assert.NotContains(t, p.output(), "unavailable")
+}
+
+// TestHelp_AutoInstall_ServerOptOutShowsPlaceholderHelpQuietly is the help-side half
+// of TestRun_AutoInstall_ServerDecisionGatesInstalling. A plugin without auto-install
+// enabled shows the placeholder help without an explanation.
+func TestHelp_AutoInstall_ServerOptOutShowsPlaceholderHelpQuietly(t *testing.T) {
+	p := newAutoInstallTestCmd("directory")
+	p.lookupFn = pluginFound
+	installCalled := false
+	p.installFn = func(ctx context.Context) error { installCalled = true; return nil }
+	runCalled := false
+	p.runPluginFn = func(cmd *cobra.Command, args []string) error { runCalled = true; return nil }
+
+	err := runViaCobra(t, p, nil, []string{"stripe", "directory", "--help"})
+
+	require.NoError(t, err)
+	assert.False(t, installCalled)
+	assert.False(t, runCalled)
+	assert.Contains(t, p.output(), "Test description.")
+	assert.NotContains(t, p.output(), "unavailable")
+	assert.NotContains(t, p.output(), "stripe plugin install directory")
+	assert.Empty(t, p.errOutput())
+}
+
+func TestHelp_WithoutAutoInstall_ShowsPlaceholderHelp(t *testing.T) {
+	p := newAutoInstallTestCmd("apps")
+	p.lookupFn = pluginFound
+	p.runPluginFn = func(cmd *cobra.Command, args []string) error { return nil }
+	installCalled := false
+	p.installFn = func(ctx context.Context) error { installCalled = true; return nil }
+
+	err := runViaCobra(t, p, nil, []string{"stripe", "apps", "--help"})
+
+	require.NoError(t, err)
+	assert.False(t, installCalled)
+	assert.Contains(t, p.output(), "Test description.")
+	assert.NotContains(t, p.output()+p.errOutput(), "one-time setup")
 }
 
 // --- promptInstall ---
@@ -249,26 +1179,13 @@ func TestPromptInstall_InstallError_ReturnsError(t *testing.T) {
 
 // --- promptLogin ---
 
-func TestPromptLogin_EnterKey_LogsIn(t *testing.T) {
-	p := newTestCmd("docs")
-	p.stdin = strings.NewReader("\n")
-	loginCalled := false
-	p.loginFn = func(ctx context.Context) error { loginCalled = true; return nil }
-
-	err := p.promptLogin(context.Background())
-
-	require.NoError(t, err)
-	assert.True(t, loginCalled)
-	assert.Contains(t, p.output(), "stripe login")
-}
-
 func TestPromptLogin_OtherInput_CancelsLogin(t *testing.T) {
 	p := newTestCmd("docs")
 	p.stdin = strings.NewReader("n\n")
 	loginCalled := false
 	p.loginFn = func(ctx context.Context) error { loginCalled = true; return nil }
 
-	err := p.promptLogin(context.Background())
+	err := p.offerLogin(context.Background(), validators.ErrAPIKeyNotConfigured)
 
 	assert.EqualError(t, err, "login canceled")
 	assert.False(t, loginCalled)
@@ -279,7 +1196,7 @@ func TestPromptLogin_LoginError_ReturnsError(t *testing.T) {
 	p.stdin = strings.NewReader("\n")
 	p.loginFn = func(ctx context.Context) error { return errors.New("login failed") }
 
-	err := p.promptLogin(context.Background())
+	err := p.offerLogin(context.Background(), validators.ErrAPIKeyNotConfigured)
 
 	assert.EqualError(t, err, "login failed")
 }

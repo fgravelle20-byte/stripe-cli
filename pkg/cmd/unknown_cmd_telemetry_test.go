@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -33,18 +34,7 @@ func (m *mockUnknownCmdTelemetryClient) SendEvent(_ context.Context, eventName s
 }
 
 func TestRecordUnknownCommand_NotInAgentEnv(t *testing.T) {
-	t.Setenv("CLAUDECODE", "")
-	t.Setenv("CURSOR_AGENT", "")
-	t.Setenv("CODEX_INTERNAL_ORIGINATOR_OVERRIDE", "")
-	t.Setenv("CODEX_SANDBOX", "")
-	t.Setenv("CODEX_THREAD_ID", "")
-	t.Setenv("CODEX_SANDBOX_NETWORK_DISABLED", "")
-	t.Setenv("CODEX_CI", "")
-	t.Setenv("CLINE_ACTIVE", "")
-	t.Setenv("GEMINI_CLI", "")
-	t.Setenv("OPENCODE", "")
-	t.Setenv("OPENCLAW_SHELL", "")
-	t.Setenv("ANTIGRAVITY_CLI_ALIAS", "")
+	clearAgentEnv(t)
 
 	tmpDir := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", tmpDir)
@@ -113,6 +103,23 @@ func TestRecordUnknownCommand_InAgentEnv_SendsAtBatchSize(t *testing.T) {
 	assert.Len(t, entries, 10)
 	assert.Equal(t, "stripe bazqux", entries[0].Command)
 	assert.Equal(t, "claude_code", entries[0].Agent)
+}
+
+func TestSanitizeUnknownCommand_StopsAtFirstFlag(t *testing.T) {
+	assert.Equal(t, "foobar create", sanitizeUnknownCommand([]string{"foobar", "create", "--api-key", "sk_live_secret"}))
+}
+
+func TestSanitizeUnknownCommand_CapsTokenCount(t *testing.T) {
+	assert.Equal(t, "a b c", sanitizeUnknownCommand([]string{"a", "b", "c", "d", "e"}))
+}
+
+func TestSanitizeUnknownCommand_CapsTokenLength(t *testing.T) {
+	long := strings.Repeat("x", 100)
+	assert.Equal(t, strings.Repeat("x", unknownCmdMaxTokenLen), sanitizeUnknownCommand([]string{long}))
+}
+
+func TestSanitizeUnknownCommand_NoArgs(t *testing.T) {
+	assert.Equal(t, "", sanitizeUnknownCommand(nil))
 }
 
 func TestRecordUnknownCommand_NoTelemetryClient(t *testing.T) {

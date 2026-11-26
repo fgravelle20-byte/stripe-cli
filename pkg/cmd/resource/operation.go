@@ -55,7 +55,10 @@ func (oc *OperationCmd) runOperationCmd(cmd *cobra.Command, args []string) error
 
 	creds, credsErr := oc.ResolveCredentials()
 
-	path := formatURL(oc.Path, args)
+	path, err := stripe.FormatURLPath(oc.Path, args)
+	if err != nil {
+		return err
+	}
 	requestParams := make(map[string]interface{})
 	oc.addStringRequestParams(requestParams)
 	oc.addIntRequestParams(requestParams)
@@ -111,14 +114,12 @@ func (oc *OperationCmd) runOperationCmd(cmd *cobra.Command, args []string) error
 			fmt.Println("Exiting without execution. User did not confirm the command.")
 			return nil
 		}
-
-		// if confirmation is provided, make the request
-		_, err = oc.MakeRequest(cmd.Context(), creds, path, &oc.Parameters, requestParams, false, nil)
-
-		return err
 	}
-	// else
-	_, err := oc.MakeRequest(cmd.Context(), creds, path, &oc.Parameters, requestParams, false, nil)
+	if oc.RequestMediaType == "multipart/form-data" {
+		_, err = oc.MakeMultiPartRequestWithAdditionalParams(cmd.Context(), creds, path, &oc.Parameters, requestParams, false)
+	} else {
+		_, err = oc.MakeRequest(cmd.Context(), creds, path, &oc.Parameters, requestParams, false, nil)
+	}
 	return err
 }
 
@@ -154,6 +155,7 @@ func NewOperationCmd(parentCmd *cobra.Command, opSpec *OperationSpec, cfg *confi
 	operationCmd := &OperationCmd{
 		Base: &requests.Base{
 			Method:           method,
+			RequestMediaType: opSpec.RequestMediaType,
 			Profile:          &cfg.Profile,
 			IsPreviewCommand: opSpec.IsPreview,
 		},
@@ -216,6 +218,7 @@ func NewOperationCmd(parentCmd *cobra.Command, opSpec *OperationSpec, cfg *confi
 		}
 	}
 
+	cmd.Flags().SetNormalizeFunc(normalizeBracketNestedFlag)
 	cmd.SetUsageTemplate(operationUsageTemplate(urlParams))
 	cmd.DisableFlagsInUseLine = true
 	operationCmd.Cmd = cmd
@@ -254,6 +257,9 @@ func paramFlagName(param string) string {
 
 // exampleValue returns the placeholder value string to use in an example for the given param.
 func exampleValue(ps *ParamSpec) string {
+	if ps.Format == "binary" {
+		return "<file-path>"
+	}
 	switch ps.Type {
 	case "integer":
 		return "<integer>"
@@ -338,18 +344,6 @@ func extractURLParams(path string) []string {
 	return re.FindAllString(path, -1)
 }
 
-func formatURL(path string, urlParams []string) string {
-	s := make([]interface{}, len(urlParams))
-	for i, v := range urlParams {
-		s[i] = v
-	}
-
-	re := regexp.MustCompile(`{\w+}`)
-	format := re.ReplaceAllString(path, "%s")
-
-	return fmt.Sprintf(format, s...)
-}
-
 func operationUsageTemplate(urlParams []string) string {
 	args := strings.Map(func(r rune) rune {
 		switch r {
@@ -364,7 +358,7 @@ func operationUsageTemplate(urlParams []string) string {
 		args += " "
 	}
 
-	args += "[--param=value] [-d \"nested[param]=value\"]"
+	args += "[--param=value] [--parent[child]=value] [-d \"nested[param]=value\"]"
 
 	return fmt.Sprintf(`%s{{if .Runnable}}
   {{.UseLine}} %s{{end}}{{if .HasAvailableSubCommands}}
@@ -425,6 +419,12 @@ func (oc *OperationCmd) addStringRequestParams(requestParams map[string]interfac
 		if oc.Cmd.Flags().Changed(stringProp) {
 			paramName := getParamName(stringProp)
 			val := *stringVal
+			if oc.RequestMediaType == "multipart/form-data" && !strings.HasPrefix(val, "@") {
+				format := oc.Cmd.Flags().Lookup(stringProp).Annotations["format"]
+				if len(format) > 0 && format[0] == "binary" {
+					val = "@" + val
+				}
+			}
 			// For clearable_object flags, "{}" is accepted as an alias for "" for
 			// compatibility with other tools. The v1 API requires an empty string to
 			// clear the field, so translate "{}" accordingly.

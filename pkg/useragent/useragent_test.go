@@ -1,69 +1,11 @@
 package useragent
 
 import (
-	"errors"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 )
-
-func noStat(string) error     { return errors.New("not found") }
-func yesStat(string) error    { return nil }
-func errExe() (string, error) { return "", errors.New("error") }
-
-func exe(path string) func() (string, error) {
-	return func() (string, error) { return path, nil }
-}
-
-func env(val string) func(string) string {
-	return func(string) string { return val }
-}
-
-func noEnv(string) string { return "" }
-
-func TestDetectInstallMethod(t *testing.T) {
-	tests := []struct {
-		name     string
-		envVal   string
-		exePath  string
-		exeErr   bool
-		hasStat  bool
-		expected string
-	}{
-		{"npm_global via env", "npm_global", "/any/path", false, false, "npm_global"},
-		{"npm_run via env", "npm_run", "/any/path", false, false, "npm_run"},
-		{"npx via env", "npx", "/any/path", false, false, "npx"},
-		{"homebrew cellar", "", "/opt/homebrew/Cellar/stripe/1.0/bin/stripe", false, false, "homebrew"},
-		{"homebrew usr local cellar", "", "/usr/local/Cellar/stripe/1.0/bin/stripe", false, false, "homebrew"},
-		{"scoop", "", "C:/Users/foo/scoop/apps/stripe/current/stripe.exe", false, false, "scoop"},
-		{"apt with dpkg file", "", "/usr/bin/stripe", false, true, "apt"},
-		{"unknown no dpkg file", "", "/usr/bin/stripe", false, false, "unknown"},
-		{"unknown exe error", "", "", true, false, "unknown"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			getEnv := noEnv
-			if tt.envVal != "" {
-				getEnv = env(tt.envVal)
-			}
-
-			getExe := exe(tt.exePath)
-			if tt.exeErr {
-				getExe = errExe
-			}
-
-			statFn := noStat
-			if tt.hasStat {
-				statFn = yesStat
-			}
-
-			result := DetectInstallMethod(getEnv, getExe, statFn)
-			require.Equal(t, tt.expected, result)
-		})
-	}
-}
 
 func TestDetectInTmux(t *testing.T) {
 	tests := []struct {
@@ -136,6 +78,8 @@ func TestDetectAgentHost(t *testing.T) {
 		kind string
 		raw  string
 	}{
+		{"hermes desktop", map[string]string{"HERMES_DESKTOP": "true"}, "desktop", "hermes"},
+		{"hermes desktop, any non-empty value counts", map[string]string{"HERMES_DESKTOP": "1"}, "desktop", "hermes"},
 		{"claude desktop", map[string]string{"CLAUDE_CODE_ENTRYPOINT": "claude-desktop"}, "desktop", "claude-desktop"},
 		// Both are desktop, and raw is the only thing that tells them apart.
 		{"claude desktop 3p", map[string]string{"CLAUDE_CODE_ENTRYPOINT": "claude-desktop-3p"}, "desktop", "claude-desktop-3p"},
@@ -153,6 +97,33 @@ func TestDetectAgentHost(t *testing.T) {
 		{"uncategorized codex host", map[string]string{"CODEX_INTERNAL_ORIGINATOR_OVERRIDE": "Codex Web"}, "other", "codex-web"},
 		{"no host", map[string]string{}, "", ""},
 
+		// The originators Codex enumerates, normalized. The VS Code extension is the one
+		// with observed traffic; it reported "other" until it was mapped here.
+		{"codex vscode", map[string]string{"CODEX_INTERNAL_ORIGINATOR_OVERRIDE": "codex_vscode"}, "ide", "codex-vscode"},
+		{"codex tui", map[string]string{"CODEX_INTERNAL_ORIGINATOR_OVERRIDE": "codex-tui"}, "terminal", "codex-tui"},
+		{"codex cli rs", map[string]string{"CODEX_INTERNAL_ORIGINATOR_OVERRIDE": "codex_cli_rs"}, "terminal", "codex-cli-rs"},
+		{"codex exec", map[string]string{"CODEX_INTERNAL_ORIGINATOR_OVERRIDE": "codex_exec"}, "terminal", "codex-exec"},
+		{"codex mcp server", map[string]string{"CODEX_INTERNAL_ORIGINATOR_OVERRIDE": "codex_mcp_server"}, "mcp", "codex-mcp-server"},
+		{"codex app server", map[string]string{"CODEX_INTERNAL_ORIGINATOR_OVERRIDE": "codex-app-server"}, "sdk", "codex-app-server"},
+		{"codex app server sdk", map[string]string{"CODEX_INTERNAL_ORIGINATOR_OVERRIDE": "codex-app-server-sdk"}, "sdk", "codex-app-server-sdk"},
+		// "none" means Codex reported no originator, so it stays uncategorized rather
+		// than being mapped to a surface it does not name.
+		{"codex none stays uncategorized", map[string]string{"CODEX_INTERNAL_ORIGINATOR_OVERRIDE": "none"}, "other", "none"},
+
+		// Codex names every surface except the terminal, so a detected Codex agent with no
+		// originator is a terminal one. This is the only inferred host.
+		{"codex terminal inferred from sandbox signal", map[string]string{"CODEX_SANDBOX": "1"}, "terminal", "codex-cli"},
+		{"codex terminal inferred from thread signal", map[string]string{"CODEX_THREAD_ID": "thread-abc"}, "terminal", "codex-cli"},
+		// Grok Build sets GROK_AGENT for its terminal TUI but not for its ACP/IDE
+		// surface, which sets only GROK_SESSION_ID
+		{"grok terminal inferred from agent signal", map[string]string{"GROK_AGENT": "1"}, "terminal", "grok-cli"},
+		{"grok acp inferred from session signal without agent", map[string]string{"GROK_SESSION_ID": "01a0b015-bf40-7673-a055-afee8019dc33"}, "ide", "grok-acp"},
+		// The inference is gated on the agent, so it does not fire for anyone else. Claude
+		// Code without an entrypoint has no host, rather than a guessed terminal.
+		{"claude code without entrypoint stays hostless", map[string]string{"CLAUDECODE": "1"}, "", ""},
+		{"cursor stays hostless", map[string]string{"CURSOR_AGENT": "1"}, "", ""},
+		{"openclaw shell", map[string]string{"OPENCLAW_SHELL": "1"}, "terminal", "openclaw"},
+
 		// Normalization runs before reporting, so one host cannot arrive under several
 		// spellings -- including from different platforms.
 		{"raw is normalized, not verbatim", map[string]string{"CLAUDE_CODE_ENTRYPOINT": " Some_New HOST "}, "other", "some-new-host"},
@@ -165,6 +136,91 @@ func TestDetectAgentHost(t *testing.T) {
 			kind, raw := DetectAgentHost(mapEnv(tt.envs))
 			require.Equal(t, tt.kind, kind)
 			require.Equal(t, tt.raw, raw)
+		})
+	}
+}
+
+// TestDetectAIAgent_InferredFromHost covers the surfaces that name a host without setting
+// the agent variable that normally identifies them, which previously reported a host with
+// no agent attached.
+func TestDetectAIAgent_InferredFromHost(t *testing.T) {
+	tests := []struct {
+		name        string
+		envs        map[string]string
+		expected    string
+		description string
+	}{
+		{
+			name:        "claude code entrypoint without CLAUDECODE",
+			envs:        map[string]string{"CLAUDE_CODE_ENTRYPOINT": "remote-trigger"},
+			expected:    "claude_code",
+			description: "hosted and SDK entrypoints do not always set CLAUDECODE",
+		},
+		{
+			name:        "codex originator without the generic codex signals",
+			envs:        map[string]string{"CODEX_INTERNAL_ORIGINATOR_OVERRIDE": "Codex Desktop"},
+			expected:    "codex_cli",
+			description: "the generic signals are sandbox-, permission- and CI-dependent",
+		},
+		{
+			name:        "uncategorized host still identifies the agent",
+			envs:        map[string]string{"CLAUDE_CODE_ENTRYPOINT": "some-future-surface"},
+			expected:    "claude_code",
+			description: "the fallback keys off presence, not off the host being mapped",
+		},
+		// The fallback is last, so a real agent variable still wins and the reported agent
+		// stays the process that set it rather than the surface it inherited.
+		{
+			name:        "agent variable wins over inherited host",
+			envs:        map[string]string{"CURSOR_AGENT": "1", "CLAUDE_CODE_ENTRYPOINT": "claude-vscode"},
+			expected:    "cursor",
+			description: "nested agents inherit an entrypoint from the session that launched them",
+		},
+		{"no agent and no host", map[string]string{}, "", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.expected, DetectAIAgent(mapEnv(tt.envs)), tt.description)
+		})
+	}
+}
+
+// TestDetectAIAgent_AIAgentFallback covers the last-resort fallback: when no agent-specific
+// variable or inherited host names the agent, AI_AGENT and then AGENT are reported directly.
+func TestDetectAIAgent_AIAgentFallback(t *testing.T) {
+	tests := []struct {
+		name        string
+		envs        map[string]string
+		expected    string
+		description string
+	}{
+		{"reported when nothing else matches", map[string]string{"AI_AGENT": "goose_1-2-3"}, "goose_1-2-3", ""},
+		{"whitespace trimmed", map[string]string{"AI_AGENT": "  goose  "}, "goose", ""},
+		{
+			name:        "specific agent variable wins over AI_AGENT",
+			envs:        map[string]string{"CURSOR_AGENT": "1", "AI_AGENT": "goose"},
+			expected:    "cursor",
+			description: "AI_AGENT is checked last, so a direct signal still takes priority",
+		},
+		{"blank AI_AGENT reports nothing", map[string]string{"AI_AGENT": "   "}, "", ""},
+		{
+			name:        "AGENT used when AI_AGENT is absent",
+			envs:        map[string]string{"AGENT": "amp"},
+			expected:    "amp",
+			description: "AGENT is the same convention under the name Goose, Amp and Bun use",
+		},
+		{
+			name:     "AI_AGENT wins over AGENT",
+			envs:     map[string]string{"AI_AGENT": "goose", "AGENT": "amp"},
+			expected: "goose",
+		},
+		{"blank AGENT reports nothing", map[string]string{"AGENT": "   "}, "", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.expected, DetectAIAgent(mapEnv(tt.envs)), tt.description)
 		})
 	}
 }
@@ -287,8 +343,48 @@ func TestObservedAgentSessions(t *testing.T) {
 				"CODEX_SANDBOX":   "1",
 			},
 			agent:    "codex_cli",
-			hostKind: "",
+			hostKind: "terminal",
+			hostRaw:  "codex-cli",
 			version:  "",
+			description: "Codex sets no originator from a terminal, so the terminal host is " +
+				"inferred from its absence; every other Codex surface names itself",
+		},
+		{
+			name: "grok build",
+			envs: map[string]string{
+				"GROK_AGENT":      "1",
+				"GROK_SESSION_ID": sensitiveSessionID,
+			},
+			agent:    "grok",
+			hostKind: "terminal",
+			hostRaw:  "grok-cli",
+			version:  "",
+			description: "Grok Build's terminal TUI sets GROK_AGENT alongside GROK_SESSION_ID, and " +
+				"reports no version through the AI_AGENT/AGENT convention",
+		},
+		{
+			name: "openclaw shell",
+			envs: map[string]string{
+				"OPENCLAW_SHELL": "1",
+			},
+			agent:    "openclaw",
+			hostKind: "terminal",
+			hostRaw:  "openclaw",
+			version:  "",
+			description: "Openclaw's shell sets only OPENCLAW_SHELL, and " +
+				"reports no version through the AI_AGENT/AGENT convention",
+		},
+		{
+			name: "kiro terminal",
+			envs: map[string]string{
+				"KIRO_SESSION_ID": sensitiveSessionID,
+			},
+			agent:    "kiro",
+			hostKind: "terminal",
+			hostRaw:  "kiro",
+			version:  "",
+			description: "Kiro's shell sets KIRO_SESSION_ID, and " +
+				"reports no version through the AI_AGENT/AGENT convention",
 		},
 	}
 
@@ -329,6 +425,9 @@ func TestObservedAgentSessions_NoSensitiveValuesReported(t *testing.T) {
 		"CODEX_THREAD_ID":                    sensitiveThreadID,
 		"CODEX_INTERNAL_ORIGINATOR_OVERRIDE": "Codex Desktop",
 		"CODEX_PERMISSION_PROFILE":           ":read-only",
+		"GROK_AGENT":                         "1",
+		"GROK_SESSION_ID":                    sensitiveSessionID,
+		"OPENCLAW_SHELL":                     "1",
 	}
 	getEnv := mapEnv(envs)
 
@@ -338,7 +437,6 @@ func TestObservedAgentSessions_NoSensitiveValuesReported(t *testing.T) {
 		DetectAIAgent(getEnv),
 		hostKind,
 		DetectAgentVersion(getEnv),
-		DetectInstallMethod(getEnv, errExe, noStat),
 		DetectTerminalProgram(getEnv),
 	}
 

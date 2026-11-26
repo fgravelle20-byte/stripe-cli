@@ -2,9 +2,13 @@ package config
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/spf13/viper"
 	"github.com/stretchr/testify/require"
@@ -12,6 +16,284 @@ import (
 	"github.com/stripe/stripe-cli/pkg/errorcategory"
 	"github.com/stripe/stripe-cli/pkg/keyring"
 )
+
+const dottedNameError = `profile name "example.project" cannot contain a period; use a hyphen or underscore instead`
+
+// setupProfileConfig writes contents to a temp config file and initializes the
+// global viper from it, so tests exercise the same read path as the CLI rather
+// than viper's override layer, which nests keys by splitting on ".".
+func setupProfileConfig(t *testing.T, contents string) (*Config, string) {
+	t.Helper()
+
+	profilesFile := filepath.Join(t.TempDir(), "config.toml")
+	require.NoError(t, os.WriteFile(profilesFile, []byte(contents), 0600))
+
+	if KeyRing == nil {
+		KeyRing = keyring.NewMemoryStore(nil)
+	}
+	t.Cleanup(func() {
+		KeyRing = nil
+		viper.Reset()
+	})
+
+	c := &Config{LogLevel: "info", ProfilesFile: profilesFile}
+	c.InitConfig()
+
+	return c, profilesFile
+}
+
+func TestValidateProfileName(t *testing.T) {
+	tests := []struct {
+		name        string
+		profileName string
+		wantError   string
+	}{
+		{name: "hyphenated", profileName: "example-project"},
+		{name: "underscored", profileName: "example_project"},
+		// Every character other than "." round-trips correctly through viper and
+		// TOML, so the rule stays as narrow as the actual constraint.
+		{name: "spaces", profileName: "example project"},
+		{name: "whitespace only", profileName: " "},
+		{name: "double quote", profileName: `example"project`},
+		{name: "single quote", profileName: "example'project"},
+		{name: "equals", profileName: "example=project"},
+		{name: "hash", profileName: "example#project"},
+		{name: "brackets", profileName: "example[project]"},
+		{name: "slashes", profileName: `example/\project`},
+		{name: "unicode", profileName: "ünïcode"},
+		{name: "uppercase", profileName: "ExampleProject"},
+
+		{name: "dotted", profileName: "example.project", wantError: dottedNameError},
+		{name: "leading dot", profileName: ".example", wantError: `profile name ".example" cannot contain a period; use a hyphen or underscore instead`},
+		// An empty name produces a ".<field>" key, which viper drops silently, so
+		// every write to it is discarded without an error.
+		{name: "empty", profileName: "", wantError: "profile name cannot be empty"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateProfileName(tt.profileName)
+			if tt.wantError == "" {
+				require.NoError(t, err)
+				return
+			}
+
+			require.EqualError(t, err, tt.wantError)
+		})
+	}
+}
+
+func TestValidateProfileNameForWriteAllowsExistingProfiles(t *testing.T) {
+	tests := []struct {
+		name        string
+		profileName string
+		contents    string
+		wantExists  bool
+		wantError   string
+	}{
+		{
+			name:        "new dotted profile is rejected",
+			profileName: "example.project",
+			contents:    "[default]\ndisplay_name = 'Default'\n",
+			wantError:   dottedNameError,
+		},
+		{
+			name:        "existing dotted profile is allowed",
+			profileName: "example.project",
+			contents:    "[\"example.project\"]\ndisplay_name = 'Existing profile'\n",
+			wantExists:  true,
+		},
+		{
+			// A dotted profile written before this rule existed may have no
+			// display_name. It must still be recognized as existing, or it becomes
+			// unreachable: not writable, not listable, and not removable.
+			name:        "existing dotted profile without display_name is allowed",
+			profileName: "example.project",
+			contents:    "[\"example.project\"]\ncolor = 'on'\n",
+			wantExists:  true,
+		},
+		{
+			name:        "already-nested form is allowed",
+			profileName: "example.project",
+			contents:    "[example]\n[example.project]\ncolor = 'on'\n",
+			wantExists:  true,
+		},
+		{
+			name:        "space-separated profile is not equivalent",
+			profileName: "example.project",
+			contents:    "['example project']\ndisplay_name = 'Existing profile'\n",
+			wantError:   dottedNameError,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setupProfileConfig(t, tt.contents)
+
+			p := Profile{ProfileName: tt.profileName}
+			require.Equal(t, tt.wantExists, p.profileExists())
+
+			err := p.ValidateProfileNameForWrite()
+			if tt.wantError == "" {
+				require.NoError(t, err)
+				return
+			}
+
+			require.EqualError(t, err, tt.wantError)
+		})
+	}
+}
+
+func TestWarnIfLegacyProfileName(t *testing.T) {
+	tests := []struct {
+		name        string
+		profileName string
+		contents    string
+		wantWarning bool
+	}{
+		{
+			name:        "existing dotted profile warns",
+			profileName: "example.project",
+			contents:    "[\"example.project\"]\ndisplay_name = 'Legacy'\n",
+			wantWarning: true,
+		},
+		{
+			// Nothing is broken until such a profile is actually written, so
+			// warning here would only be noise.
+			name:        "dotted profile that is not in the config file is silent",
+			profileName: "example.project",
+			contents:    "[default]\ndisplay_name = 'Default'\n",
+		},
+		{
+			name:        "valid profile is silent",
+			profileName: "default",
+			contents:    "[default]\ndisplay_name = 'Default'\n",
+		},
+		{
+			name:     "empty profile name is silent",
+			contents: "[default]\ndisplay_name = 'Default'\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setupProfileConfig(t, tt.contents)
+
+			warnLegacyProfileNameOnce = sync.Once{}
+			t.Cleanup(func() { warnLegacyProfileNameOnce = sync.Once{} })
+
+			p := Profile{ProfileName: tt.profileName}
+			stderr := captureStderr(t, p.WarnIfLegacyProfileName)
+
+			if !tt.wantWarning {
+				require.Empty(t, stderr)
+				return
+			}
+
+			require.Contains(t, stderr, `The profile "example.project" contains a period`)
+			require.Contains(t, stderr, "stripe login --project-name example-project")
+			require.Contains(t, stderr, "stripe config --remove-profile example.project")
+		})
+	}
+}
+
+// The warning is printed once per process so it does not repeat for every
+// command in a session.
+func TestWarnIfLegacyProfileNameOnlyWarnsOnce(t *testing.T) {
+	setupProfileConfig(t, "[\"example.project\"]\ndisplay_name = 'Legacy'\n")
+
+	warnLegacyProfileNameOnce = sync.Once{}
+	t.Cleanup(func() { warnLegacyProfileNameOnce = sync.Once{} })
+
+	p := Profile{ProfileName: "example.project"}
+	require.NotEmpty(t, captureStderr(t, p.WarnIfLegacyProfileName))
+	require.Empty(t, captureStderr(t, p.WarnIfLegacyProfileName))
+}
+
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+
+	original := os.Stderr
+	os.Stderr = w
+	fn()
+	os.Stderr = original
+	require.NoError(t, w.Close())
+
+	out, err := io.ReadAll(r)
+	require.NoError(t, err)
+
+	return string(out)
+}
+
+func TestCreateProfileRejectsNewDottedNameBeforeMutation(t *testing.T) {
+	initialConfig := "[default]\ndisplay_name = 'Default'\n"
+
+	KeyRing = keyring.NewMemoryStore(map[string][]byte{
+		"example.project.live_mode_api_key": []byte("existing-value"),
+	})
+	_, profilesFile := setupProfileConfig(t, initialConfig)
+
+	p := Profile{
+		ProfileName:    "example.project",
+		DisplayName:    "New profile",
+		LiveModeAPIKey: "new-value",
+	}
+	require.EqualError(t, p.CreateProfile(), dottedNameError)
+
+	require.Equal(t, []byte(initialConfig), helperLoadBytes(t, profilesFile))
+	storedValue, err := KeyRing.Get("example.project.live_mode_api_key")
+	require.NoError(t, err)
+	require.Equal(t, []byte("existing-value"), storedValue)
+}
+
+// WriteConfigField is a separate write path from CreateProfile, reached by
+// `stripe config --set` and docs preferences. It must
+// enforce the same rule, otherwise the ban can be bypassed entirely.
+func TestWriteConfigFieldRejectsNewDottedName(t *testing.T) {
+	initialConfig := "[default]\ndisplay_name = 'Default'\n"
+	_, profilesFile := setupProfileConfig(t, initialConfig)
+
+	p := Profile{ProfileName: "example.project"}
+	require.EqualError(t, p.WriteConfigField("color", "off"), dottedNameError)
+
+	require.Equal(t, []byte(initialConfig), helperLoadBytes(t, profilesFile))
+}
+
+func TestWriteConfigFieldRejectsEmptyProfileName(t *testing.T) {
+	initialConfig := "[default]\ndisplay_name = 'Default'\n"
+	_, profilesFile := setupProfileConfig(t, initialConfig)
+
+	p := Profile{ProfileName: ""}
+	require.EqualError(t, p.WriteConfigField("color", "off"), "profile name cannot be empty")
+
+	require.Equal(t, []byte(initialConfig), helperLoadBytes(t, profilesFile))
+}
+
+// A dotted profile that predates this rule must stay writable, or it becomes
+// permanently stuck: unusable and unfixable.
+func TestCreateProfileAllowsExistingDottedName(t *testing.T) {
+	setupProfileConfig(t, "[\"example.project\"]\ndisplay_name = 'Existing profile'\n")
+
+	p := Profile{
+		ProfileName: "example.project",
+		DisplayName: "Updated profile",
+		DeviceName:  "test-device",
+	}
+	require.NoError(t, p.CreateProfile())
+	require.Equal(t, "Updated profile", viper.GetString("example.project.display_name"))
+	require.Equal(t, "test-device", viper.GetString("example.project.device_name"))
+}
+
+func TestWriteConfigFieldAllowsExistingDottedNameWithoutDisplayName(t *testing.T) {
+	setupProfileConfig(t, "[example]\n[example.project]\ncolor = 'on'\n")
+
+	p := Profile{ProfileName: "example.project"}
+	require.NoError(t, p.WriteConfigField("device_name", "test-device"))
+	require.Equal(t, "test-device", viper.GetString("example.project.device_name"))
+}
 
 func TestWriteProfile(t *testing.T) {
 	profilesFile := filepath.Join(t.TempDir(), "config.toml")
@@ -278,7 +560,7 @@ func TestResolveCredentialsOAKLivemodeNoCompartment(t *testing.T) {
 	p := Profile{ProfileName: "default"}
 	_, err := p.ResolveCredentials(true)
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "you're logged in to a sandbox")
+	require.Contains(t, err.Error(), "You're logged in to a sandbox")
 	require.Contains(t, err.Error(), "stripe login")
 }
 
@@ -356,6 +638,162 @@ func TestResolveCredentialsForAnyModeRetriesOnLivemodeMismatch(t *testing.T) {
 	creds, err := p.ResolveCredentialsForAnyMode(false)
 	require.NoError(t, err)
 	require.Equal(t, "oak_live_1234567890", creds.Token)
+}
+
+func TestRefreshUATIfNeededSkipsWhenNotExpiring(t *testing.T) {
+	KeyRing = keyring.NewMemoryStore(nil)
+	t.Cleanup(func() { KeyRing = nil })
+	require.NoError(t, (&Profile{}).SaveUATExpiresAt(time.Now().Add(time.Hour)))
+
+	previousRefresher := OAuthTokenRefresher
+	t.Cleanup(func() { OAuthTokenRefresher = previousRefresher })
+	OAuthTokenRefresher = func(p *Profile) error {
+		t.Fatal("refresher should not be called when the token isn't near expiry")
+		return nil
+	}
+
+	p := &Profile{UAT: "oak_live_original"}
+	uat, err := RefreshUATIfNeeded(p, "oak_live_original")
+	require.NoError(t, err)
+	require.Equal(t, "oak_live_original", uat)
+}
+
+func TestRefreshUATIfNeededRefreshesWhenNearExpiry(t *testing.T) {
+	KeyRing = keyring.NewMemoryStore(nil)
+	t.Cleanup(func() { KeyRing = nil })
+	require.NoError(t, (&Profile{}).SaveUATExpiresAt(time.Now().Add(30*time.Second)))
+
+	previousRefresher := OAuthTokenRefresher
+	t.Cleanup(func() { OAuthTokenRefresher = previousRefresher })
+	OAuthTokenRefresher = func(p *Profile) error {
+		p.UAT = "oak_live_refreshed"
+		return nil
+	}
+
+	p := &Profile{UAT: "oak_live_original"}
+	uat, err := RefreshUATIfNeeded(p, "oak_live_original")
+	require.NoError(t, err)
+	require.Equal(t, "oak_live_refreshed", uat)
+}
+
+func TestRefreshUATIfNeededPropagatesRefreshError(t *testing.T) {
+	KeyRing = keyring.NewMemoryStore(nil)
+	t.Cleanup(func() { KeyRing = nil })
+	require.NoError(t, (&Profile{}).SaveUATExpiresAt(time.Now().Add(30*time.Second)))
+
+	previousRefresher := OAuthTokenRefresher
+	t.Cleanup(func() { OAuthTokenRefresher = previousRefresher })
+	refreshErr := errors.New("session expired")
+	OAuthTokenRefresher = func(p *Profile) error {
+		return refreshErr
+	}
+
+	p := &Profile{UAT: "oak_live_original"}
+	uat, err := RefreshUATIfNeeded(p, "oak_live_original")
+	require.ErrorIs(t, err, refreshErr)
+	require.Equal(t, "oak_live_original", uat)
+}
+
+func TestRefreshUATIfNeededNoopWithoutRefresher(t *testing.T) {
+	KeyRing = keyring.NewMemoryStore(nil)
+	t.Cleanup(func() { KeyRing = nil })
+	require.NoError(t, (&Profile{}).SaveUATExpiresAt(time.Now().Add(30*time.Second)))
+
+	previousRefresher := OAuthTokenRefresher
+	t.Cleanup(func() { OAuthTokenRefresher = previousRefresher })
+	OAuthTokenRefresher = nil
+
+	p := &Profile{UAT: "oak_live_original"}
+	uat, err := RefreshUATIfNeeded(p, "oak_live_original")
+	require.NoError(t, err)
+	require.Equal(t, "oak_live_original", uat)
+}
+
+func TestKeyringKeyDefaultProfileUsesUnscopedLegacyKey(t *testing.T) {
+	require.Equal(t, UATKeychainItemKey, (&Profile{}).KeyringKey(UATKeychainItemKey))
+	require.Equal(t, UATKeychainItemKey, (&Profile{ProfileName: "default"}).KeyringKey(UATKeychainItemKey))
+}
+
+func TestKeyringKeyNamedProfileIsScoped(t *testing.T) {
+	require.Equal(t, UATKeychainItemKey+":work", (&Profile{ProfileName: "work"}).KeyringKey(UATKeychainItemKey))
+}
+
+// TestOAuthSessionIsolationAcrossProfiles guards against a regression where
+// two profiles logged in independently would clobber each other's UAT
+// expiry and active context, since those were previously stored under
+// fixed, unscoped keyring keys shared by every profile.
+func TestOAuthSessionIsolationAcrossProfiles(t *testing.T) {
+	KeyRing = keyring.NewMemoryStore(nil)
+	t.Cleanup(func() { KeyRing = nil })
+
+	work := &Profile{ProfileName: "work"}
+	personal := &Profile{ProfileName: "personal"}
+
+	workExpiry := time.Now().Add(time.Hour).Truncate(time.Second)
+	personalExpiry := time.Now().Add(2 * time.Hour).Truncate(time.Second)
+	require.NoError(t, work.SaveUATExpiresAt(workExpiry))
+	require.NoError(t, personal.SaveUATExpiresAt(personalExpiry))
+	require.NoError(t, work.SaveActiveContext("acct_work", true))
+	require.NoError(t, personal.SaveActiveContext("acct_personal", false))
+
+	gotWorkExpiry, err := work.GetUATExpiresAt()
+	require.NoError(t, err)
+	require.True(t, workExpiry.Equal(gotWorkExpiry))
+
+	gotPersonalExpiry, err := personal.GetUATExpiresAt()
+	require.NoError(t, err)
+	require.True(t, personalExpiry.Equal(gotPersonalExpiry))
+
+	workCtx, err := work.GetActiveContext()
+	require.NoError(t, err)
+	require.Equal(t, "acct_work", workCtx.AccountID)
+	require.True(t, workCtx.Livemode)
+
+	personalCtx, err := personal.GetActiveContext()
+	require.NoError(t, err)
+	require.Equal(t, "acct_personal", personalCtx.AccountID)
+	require.False(t, personalCtx.Livemode)
+
+	// Deleting one profile's OAuth session must not disturb the other's.
+	require.NoError(t, work.deleteOAuthSessionKeys())
+	workCtx, err = work.GetActiveContext()
+	require.NoError(t, err)
+	require.Nil(t, workCtx, "work's active context should be cleared")
+
+	personalCtx, err = personal.GetActiveContext()
+	require.NoError(t, err)
+	require.Equal(t, "acct_personal", personalCtx.AccountID)
+}
+
+// TestBannerDisplayNameGuardsAgainstMismatch is a regression test for the
+// name/ID mismatch issue #2085 was about: if the profile's own persisted
+// AccountID ever disagrees with the active context passed in, the display
+// name must not be trusted, so the banner falls back to the account ID.
+func TestBannerDisplayNameGuardsAgainstMismatch(t *testing.T) {
+	_, _ = setupProfileConfig(t, "[default]\naccount_id = 'acct_recorded'\ndisplay_name = 'Recorded Co'\n")
+	p := Profile{ProfileName: "default"}
+
+	t.Run("matching account ID trusts the display name", func(t *testing.T) {
+		name := p.bannerDisplayName(&ActiveContext{AccountID: "acct_recorded", Livemode: false})
+		require.Equal(t, "Recorded Co", name)
+	})
+
+	t.Run("mismatched account ID discards the display name", func(t *testing.T) {
+		name := p.bannerDisplayName(&ActiveContext{AccountID: "acct_other", Livemode: false})
+		require.Empty(t, name)
+	})
+}
+
+// TestBannerDisplayNameTrustsNameWhenProfileHasNoRecordedAccount covers a
+// profile that has never persisted its own AccountID (e.g. a brand new
+// profile mid-login): there's nothing to disagree with, so the active
+// context's display name is used as-is.
+func TestBannerDisplayNameTrustsNameWhenProfileHasNoRecordedAccount(t *testing.T) {
+	_, _ = setupProfileConfig(t, "[default]\ndisplay_name = 'Fresh Co'\n")
+	p := Profile{ProfileName: "default"}
+
+	name := p.bannerDisplayName(&ActiveContext{AccountID: "acct_new", Livemode: false})
+	require.Equal(t, "Fresh Co", name)
 }
 
 func helperLoadBytes(t *testing.T, name string) []byte {

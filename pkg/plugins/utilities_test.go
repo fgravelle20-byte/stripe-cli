@@ -8,19 +8,24 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/spf13/afero"
 	"github.com/spf13/cobra"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	cfgpkg "github.com/stripe/stripe-cli/pkg/config"
 	"github.com/stripe/stripe-cli/pkg/requests"
 	"github.com/stripe/stripe-cli/pkg/stripe"
+	"github.com/stripe/stripe-cli/pkg/validators"
 )
 
 // CustomTestConfig is a test config that allows overriding the config folder path.
@@ -32,6 +37,64 @@ type CustomTestConfig struct {
 // GetConfigFolder overrides the TestConfig method to return a custom path.
 func (c *CustomTestConfig) GetConfigFolder(xdgPath string) string {
 	return c.customConfigPath
+}
+
+func TestUnsafePluginMetadataDoesNotFallBack(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX ownership and mode checks")
+	}
+	for _, legacy := range []bool{false, true} {
+		t.Run(fmt.Sprintf("legacy=%v", legacy), func(t *testing.T) {
+			cfg := &CustomTestConfig{customConfigPath: "/config"}
+			fs := afero.NewMemMapFs()
+			plugin := Plugin{Shortname: "sample", Binary: "sample", Releases: []Release{{Version: "1.0.0", OS: runtime.GOOS, Arch: runtime.GOARCH}}}
+			require.NoError(t, writeLocalPluginMetadata(cfg, fs, plugin))
+			metadata, err := getLocalPluginMetadataPath(cfg, "sample")
+			require.NoError(t, err)
+			body, err := afero.ReadFile(fs, metadata)
+			require.NoError(t, err)
+			cache := getCachedPluginManifestPath(cfg)
+			require.NoError(t, afero.WriteFile(fs, cache, body, 0644))
+			unsafe := metadata
+			if legacy {
+				require.NoError(t, fs.Remove(metadata))
+				unsafe = cache
+			}
+			require.NoError(t, fs.Chmod(unsafe, 0666))
+			_, err = LookUpPlugin(context.Background(), cfg, fs, "sample")
+			require.True(t, IsUnsafePluginStorage(err), "%v", err)
+			_, err = resolveCachedPluginForInstall(cfg, fs, "sample", "1.0.0")
+			require.True(t, IsUnsafePluginStorage(err), "%v", err)
+			_, err = resolveCachedPluginForUpgrade(cfg, fs, "sample")
+			require.True(t, IsUnsafePluginStorage(err), "%v", err)
+			cfg.InstalledPlugins = []string{"sample"}
+			require.NoError(t, fs.MkdirAll("/config/plugins/sample/1.0.0", 0755))
+			err = BackfillMissingInstalledPluginMetadata(context.Background(), cfg, fs, "http://127.0.0.1:1", "http://127.0.0.1:1")
+			require.True(t, IsUnsafePluginStorage(err), "%v", err)
+			_, err = ResolvePluginForInstall(context.Background(), cfg, fs, "sample", "1.0.0", "http://127.0.0.1:1", "http://127.0.0.1:1")
+			require.True(t, IsUnsafePluginStorage(err), "%v", err)
+		})
+	}
+}
+
+func TestProtectedPluginCacheOffline(t *testing.T) {
+	cfg := &CustomTestConfig{customConfigPath: "/config"}
+	fs := afero.NewMemMapFs()
+	plugin := Plugin{Shortname: "sample", Binary: "sample", Releases: []Release{{Version: "1.0.0", OS: runtime.GOOS, Arch: runtime.GOARCH}}}
+	require.NoError(t, writeLocalPluginMetadata(cfg, fs, plugin))
+	metadata, err := getLocalPluginMetadataPath(cfg, "sample")
+	require.NoError(t, err)
+	body, err := afero.ReadFile(fs, metadata)
+	require.NoError(t, err)
+	require.NoError(t, afero.WriteFile(fs, getCachedPluginManifestPath(cfg), body, 0644))
+	for _, legacy := range []bool{false, true} {
+		if legacy {
+			require.NoError(t, fs.Remove(metadata))
+		}
+		resolved, err := resolveCachedPluginForUpgrade(cfg, fs, "sample")
+		require.NoError(t, err)
+		require.Equal(t, "1.0.0", resolved.LookUpLatestVersion())
+	}
 }
 
 func TestListPluginsUsesAuthenticatedEndpoint(t *testing.T) {
@@ -112,7 +175,7 @@ func TestLookUpPluginUsesLocalMetadata(t *testing.T) {
 	require.Equal(t, "appB", plugin.Shortname)
 	require.Equal(t, "stripe-cli-app-b", plugin.Binary)
 	require.Equal(t, "FDBE6FB9-A149-44BD-9639-4D33D8B594E8", plugin.MagicCookieValue)
-	require.Len(t, plugin.Releases, 4)
+	require.Len(t, plugin.Releases, 5)
 }
 
 func TestLookUpPluginFallsBackToCachedManifest(t *testing.T) {
@@ -121,7 +184,7 @@ func TestLookUpPluginFallsBackToCachedManifest(t *testing.T) {
 
 	manifestContent, err := os.ReadFile("./test_artifacts/plugins.toml")
 	require.NoError(t, err)
-	require.NoError(t, afero.WriteFile(fs, getCachedPluginManifestPath(config), manifestContent, os.ModePerm))
+	require.NoError(t, afero.WriteFile(fs, getCachedPluginManifestPath(config), manifestContent, 0644))
 
 	plugin, err := LookUpPlugin(context.Background(), config, fs, "appA")
 	require.NoError(t, err)
@@ -379,6 +442,7 @@ func TestResolvePluginForInstallUsesAnonymousMetadataWithoutCachedManifest(t *te
 		switch req.URL.Path {
 		case "/ajax/stripecli/plugins_metadata":
 			metadataLookups++
+			require.False(t, req.URL.Query().Has("machine_uuid"))
 			body, err := json.Marshal(requests.PluginMetadata{
 				BinaryURL:      "https://example.test/appA/2.0.1",
 				PluginManifest: string(singlePluginManifest(t, "appA", manifestContent, nil)),
@@ -398,6 +462,113 @@ func TestResolvePluginForInstallUsesAnonymousMetadataWithoutCachedManifest(t *te
 	require.Equal(t, "2.0.1", resolvedPlugin.Version)
 	require.Equal(t, "https://example.test/appA/2.0.1", resolvedPlugin.BinaryURL)
 	require.Equal(t, 1, metadataLookups)
+}
+
+// apiKeyExpiredBody is the API's answer for a key past its expiry date.
+const apiKeyExpiredBody = `{"error":{"code":"api_key_expired","message":"Expired API Key provided: rk_test_***1111","type":"invalid_request_error"}}`
+
+// TestResolvePluginForInstallWhenAPIKeyExpired covers which installs fall back
+// to the anonymous metadata endpoint once the key has expired. A plugin anyone
+// can install must not need a fresh login, but the expired key is reported when
+// the user chose it, or when the anonymous latest could replace an installed
+// release only the account can see with an older public one.
+func TestResolvePluginForInstallWhenAPIKeyExpired(t *testing.T) {
+	manifestContent, _ := os.ReadFile("./test_artifacts/plugins.toml")
+
+	apiServer := httptest.NewServer(http.HandlerFunc(func(res http.ResponseWriter, req *http.Request) {
+		res.WriteHeader(http.StatusUnauthorized)
+		_, _ = res.Write([]byte(apiKeyExpiredBody))
+	}))
+	defer apiServer.Close()
+
+	tests := []struct {
+		name             string
+		version          string
+		installedVersion string
+		overrideKey      bool
+		wantAnonymous    bool
+	}{
+		{name: "named version", version: "2.0.1", wantAnonymous: true},
+		{name: "latest, not installed", wantAnonymous: true},
+		{name: "latest over an installed plugin", installedVersion: "3.0.0"},
+		{name: "key given via --api-key or STRIPE_API_KEY", version: "2.0.1", overrideKey: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if !tt.overrideKey {
+				stubSavedAPIKey(t)
+			}
+			config := &TestConfig{}
+			config.InitConfig()
+			fs := afero.NewMemMapFs()
+			if tt.installedVersion != "" {
+				installPath, err := (&Plugin{Shortname: "appA"}).getPluginInstallPath(config, tt.installedVersion)
+				require.NoError(t, err)
+				require.NoError(t, fs.MkdirAll(installPath, 0o755))
+			}
+
+			var dashboardRequests int
+			dashboardServer := httptest.NewServer(http.HandlerFunc(func(res http.ResponseWriter, req *http.Request) {
+				dashboardRequests++
+				assert.Equal(t, "/ajax/stripecli/plugins_metadata", req.URL.Path)
+				assert.Empty(t, req.Header.Get("Authorization"))
+				body, err := json.Marshal(requests.PluginMetadata{
+					BinaryURL:      "https://example.test/appA/2.0.1",
+					PluginManifest: string(singlePluginManifest(t, "appA", manifestContent, nil)),
+				})
+				assert.NoError(t, err)
+				_, _ = res.Write(body)
+			}))
+			defer dashboardServer.Close()
+
+			resolvedPlugin, err := ResolvePluginForInstall(context.Background(), config, fs, "appA", tt.version, apiServer.URL, dashboardServer.URL)
+			if tt.wantAnonymous {
+				require.NoError(t, err)
+				require.Equal(t, "2.0.1", resolvedPlugin.Version)
+				require.Equal(t, "https://example.test/appA/2.0.1", resolvedPlugin.BinaryURL)
+				require.Equal(t, 1, dashboardRequests)
+				return
+			}
+
+			require.True(t, requests.IsAPIKeyExpiredError(err), "want the expired key reported, got: %v", err)
+			require.Zero(t, dashboardRequests)
+		})
+	}
+}
+
+// TestResolvePluginForUpgradeDoesNotUseAnonymousMetadataWhenAPIKeyExpired covers
+// upgrades: the anonymous endpoint's latest release can be older than one only
+// the account can see, so an upgrade must not resolve against it.
+func TestResolvePluginForUpgradeDoesNotUseAnonymousMetadataWhenAPIKeyExpired(t *testing.T) {
+	stubSavedAPIKey(t)
+	config := &TestConfig{}
+	config.InitConfig()
+
+	apiServer := httptest.NewServer(http.HandlerFunc(func(res http.ResponseWriter, req *http.Request) {
+		res.WriteHeader(http.StatusUnauthorized)
+		_, _ = res.Write([]byte(apiKeyExpiredBody))
+	}))
+	defer apiServer.Close()
+
+	dashboardServer := httptest.NewServer(http.HandlerFunc(func(res http.ResponseWriter, req *http.Request) {
+		t.Errorf("unexpected anonymous retry: %s", req.URL.String())
+	}))
+	defer dashboardServer.Close()
+
+	_, err := ResolvePluginForUpgrade(context.Background(), config, afero.NewMemMapFs(), "appA", apiServer.URL, dashboardServer.URL)
+	// Kept in the chain, not just the message, so the CLI can tell the user to log
+	// in again.
+	require.True(t, requests.IsAPIKeyExpiredError(err), "want the expired key reported, got: %v", err)
+}
+
+// stubSavedAPIKey makes TestConfig's key count as one saved by `stripe login`
+// rather than an override; see hasOverrideAPIKey.
+func stubSavedAPIKey(t *testing.T) {
+	t.Helper()
+	original := hasOverrideAPIKey
+	hasOverrideAPIKey = func(*cfgpkg.Profile) bool { return false }
+	t.Cleanup(func() { hasOverrideAPIKey = original })
 }
 
 func TestResolvePluginForInstallFallsBackToCachedLocalMetadataWhenEndpointFails(t *testing.T) {
@@ -436,6 +607,110 @@ func TestResolvePluginForInstallFallsBackToCachedLocalMetadataWhenEndpointFails(
 	require.Equal(t, "appA", resolvedPlugin.Plugin.Shortname)
 	require.Equal(t, "2.0.1", resolvedPlugin.Version)
 	require.Empty(t, resolvedPlugin.BinaryURL)
+	// Nothing answered the auto-install question, so the caller keeps prompting
+	// rather than installing on an assumption.
+	require.False(t, resolvedPlugin.AutoInstall)
+	require.False(t, resolvedPlugin.AutoUpdateDefault)
+}
+
+func TestResolvePluginCarriesAutomaticUpdateAndInstallSettingsFromMetadata(t *testing.T) {
+	optedIn, optedOut := true, false
+	manifest := fmt.Sprintf(`[[Plugin]]
+  Shortname = "appA"
+  Binary = "stripe-cli-app-a"
+  MagicCookieValue = "APP-A-COOKIE"
+  [[Plugin.Release]]
+    Arch = "%s"
+    OS = "%s"
+    Version = "2.0.1"
+    Sum = "abc123"
+`, runtime.GOARCH, runtime.GOOS)
+
+	tests := []struct {
+		name string
+		// nil leaves the field out entirely, as an older server would.
+		autoInstall           *bool
+		autoUpdateDefault     *bool
+		wantAutoInstall       bool
+		wantAutoUpdateDefault bool
+	}{
+		{
+			name:            "backend enabled auto-install",
+			autoInstall:     &optedIn,
+			wantAutoInstall: true,
+		},
+		{
+			name:        "backend disabled auto-install",
+			autoInstall: &optedOut,
+		},
+		{
+			name: "server did not answer",
+		},
+		{
+			name:                  "backend enabled auto-update only",
+			autoInstall:           &optedOut,
+			autoUpdateDefault:     &optedIn,
+			wantAutoUpdateDefault: true,
+		},
+		{
+			name:                  "backend enabled both",
+			autoInstall:           &optedIn,
+			autoUpdateDefault:     &optedIn,
+			wantAutoInstall:       true,
+			wantAutoUpdateDefault: true,
+		},
+		{
+			name:              "backend disabled auto-update",
+			autoInstall:       &optedIn,
+			autoUpdateDefault: &optedOut,
+			wantAutoInstall:   true,
+		},
+	}
+
+	for _, authenticated := range []bool{true, false} {
+		for _, tt := range tests {
+			t.Run(fmt.Sprintf("authenticated=%t/%s", authenticated, tt.name), func(t *testing.T) {
+				fs := afero.NewMemMapFs()
+				config := &TestConfig{MachineUUID: "machine-abc"}
+				config.InitConfig()
+				path := "/v1/stripecli/get-plugin-metadata"
+				if !authenticated {
+					config.Profile.APIKey = ""
+					path = "/ajax/stripecli/plugins_metadata"
+				}
+
+				response := map[string]interface{}{
+					"binary_url":      "https://example.test/appA/2.0.1",
+					"plugin_manifest": manifest,
+				}
+				if tt.autoInstall != nil {
+					response["auto_install"] = *tt.autoInstall
+				}
+				if tt.autoUpdateDefault != nil {
+					response["auto_update_default"] = *tt.autoUpdateDefault
+				}
+
+				stripeServer := httptest.NewServer(http.HandlerFunc(func(res http.ResponseWriter, req *http.Request) {
+					require.Equal(t, path, req.URL.Path)
+					require.False(t, req.URL.Query().Has("machine_uuid"))
+					body, err := json.Marshal(response)
+					require.NoError(t, err)
+					_, _ = res.Write(body)
+				}))
+				defer stripeServer.Close()
+
+				resolvedPlugin, err := ResolvePluginForInstall(context.Background(), config, fs, "appA", "2.0.1", stripeServer.URL, stripeServer.URL)
+				require.NoError(t, err)
+				require.Equal(t, "2.0.1", resolvedPlugin.Version)
+				require.Equal(t, tt.wantAutoInstall, resolvedPlugin.AutoInstall)
+				require.Equal(t, tt.wantAutoUpdateDefault, resolvedPlugin.AutoUpdateDefault)
+
+				resolvedUpgrade, err := ResolvePluginForUpgrade(context.Background(), config, fs, "appA", stripeServer.URL, stripeServer.URL)
+				require.NoError(t, err)
+				require.Equal(t, resolvedPlugin, resolvedUpgrade)
+			})
+		}
+	}
 }
 
 func TestResolvePluginForInstallPrefersFresherCachedManifestWhenEndpointFails(t *testing.T) {
@@ -483,7 +758,7 @@ func TestResolvePluginForInstallPrefersFresherCachedManifestWhenEndpointFails(t 
     Version = "1.1.0"
     Sum = "def456"
 `, runtime.GOARCH, runtime.GOOS, runtime.GOARCH, runtime.GOOS))
-	require.NoError(t, afero.WriteFile(fs, getCachedPluginManifestPath(config), manifestContent, os.ModePerm))
+	require.NoError(t, afero.WriteFile(fs, getCachedPluginManifestPath(config), manifestContent, 0644))
 
 	failingServer := httptest.NewServer(http.HandlerFunc(func(res http.ResponseWriter, req *http.Request) {
 		res.WriteHeader(http.StatusInternalServerError)
@@ -563,6 +838,7 @@ func TestResolvePluginForUpgradeUsesMetadataEndpointWhenAvailable(t *testing.T) 
 	require.Equal(t, "0.1.26", resolvedPlugin.Plugin.LookUpLatestVersion())
 	require.Equal(t, "0.1.26", resolvedPlugin.Version)
 	require.Equal(t, "https://example.test/docs/latest", resolvedPlugin.BinaryURL)
+	require.False(t, resolvedPlugin.CachedMetadata)
 	require.Len(t, resolvedPlugin.Plugin.Commands, 1)
 	require.Equal(t, "search", resolvedPlugin.Plugin.Commands[0].Name)
 	require.Equal(t, 1, metadataLookups)
@@ -678,6 +954,8 @@ func TestResolvePluginForUpgradeFallsBackToCachedMetadataWhenEndpointFails(t *te
 	require.Equal(t, localPlugin, *resolvedPlugin.Plugin)
 	require.Equal(t, "0.1.25", resolvedPlugin.Version)
 	require.Empty(t, resolvedPlugin.BinaryURL)
+	require.True(t, resolvedPlugin.CachedMetadata)
+	require.False(t, resolvedPlugin.AutoUpdateDefault)
 }
 
 func TestResolvePluginForUpgradePrefersFresherCachedManifestWhenEndpointFails(t *testing.T) {
@@ -702,7 +980,7 @@ func TestResolvePluginForUpgradePrefersFresherCachedManifestWhenEndpointFails(t 
 
 	manifestContent, err := os.ReadFile("./test_artifacts/plugins.toml")
 	require.NoError(t, err)
-	require.NoError(t, afero.WriteFile(fs, getCachedPluginManifestPath(config), manifestContent, os.ModePerm))
+	require.NoError(t, afero.WriteFile(fs, getCachedPluginManifestPath(config), manifestContent, 0644))
 
 	failingServer := httptest.NewServer(http.HandlerFunc(func(res http.ResponseWriter, req *http.Request) {
 		res.WriteHeader(http.StatusInternalServerError)
@@ -797,7 +1075,7 @@ func TestBackfillMissingInstalledPluginMetadataUsesCachedManifestBeforeNetwork(t
 
 	manifestContent, err := os.ReadFile("./test_artifacts/plugins.toml")
 	require.NoError(t, err)
-	require.NoError(t, afero.WriteFile(fs, getCachedPluginManifestPath(config), manifestContent, os.ModePerm))
+	require.NoError(t, afero.WriteFile(fs, getCachedPluginManifestPath(config), manifestContent, 0644))
 
 	var requestCount int
 	stripeServer := httptest.NewServer(http.HandlerFunc(func(res http.ResponseWriter, req *http.Request) {
@@ -836,7 +1114,7 @@ func TestBackfillMissingInstalledPluginMetadataSkipsStaleCachedManifest(t *testi
     Version = "9.9.9"
     Sum = "abc123"
 `, runtime.GOARCH, runtime.GOOS))
-	require.NoError(t, afero.WriteFile(fs, getCachedPluginManifestPath(config), staleManifest, os.ModePerm))
+	require.NoError(t, afero.WriteFile(fs, getCachedPluginManifestPath(config), staleManifest, 0644))
 
 	manifestContent, err := os.ReadFile("./test_artifacts/plugins.toml")
 	require.NoError(t, err)
@@ -895,10 +1173,10 @@ func TestResolvePluginForInstallReturnsErrPluginNotFoundWhenLoggedIn(t *testing.
 }
 
 func TestResolvePluginForInstallReturnsErrPluginNotFoundWhenNotLoggedIn(t *testing.T) {
-	fs := afero.NewMemMapFs()
 	config := &TestConfig{}
 	config.InitConfig()
 	config.Profile.APIKey = ""
+	config.Profile.AccountID = "saved-account"
 
 	failingServer := httptest.NewServer(http.HandlerFunc(func(res http.ResponseWriter, req *http.Request) {
 		switch req.URL.Path {
@@ -911,12 +1189,78 @@ func TestResolvePluginForInstallReturnsErrPluginNotFoundWhenNotLoggedIn(t *testi
 	}))
 	defer failingServer.Close()
 
-	_, err := ResolvePluginForInstall(context.Background(), config, fs, "nonexistent", "1.0.0", failingServer.URL, failingServer.URL)
-	require.Error(t, err)
+	for cache, manifest := range map[string]string{
+		"missing": "",
+		"populated": `[[Plugin]]
+Shortname = "another-plugin"
+Binary = "stripe-cli-another-plugin"
+`,
+		"corrupt": "not valid TOML [",
+	} {
+		t.Run(cache, func(t *testing.T) {
+			fs := afero.NewMemMapFs()
+			if manifest != "" {
+				require.NoError(t, afero.WriteFile(fs, getCachedPluginManifestPath(config), []byte(manifest), 0600))
+			}
+			_, err := ResolvePluginForInstall(context.Background(), config, fs, "nonexistent", "1.0.0", failingServer.URL, failingServer.URL)
+			var requestErr requests.RequestError
+			require.ErrorAs(t, err, &requestErr)
+			require.Equal(t, http.StatusNotFound, requestErr.StatusCode)
+			if cache == "corrupt" {
+				require.NotErrorIs(t, err, validators.ErrAPIKeyNotConfigured)
+				require.ErrorContains(t, err, "invalid plugin manifest")
+				return
+			}
+			require.ErrorIs(t, err, validators.ErrAPIKeyNotConfigured)
+			var pluginNotFound *ErrPluginNotFound
+			require.ErrorAs(t, err, &pluginNotFound)
+			require.Equal(t, "nonexistent", pluginNotFound.Name)
+		})
+	}
+}
 
-	var pluginNotFound *ErrPluginNotFound
-	require.ErrorAs(t, err, &pluginNotFound)
-	require.Equal(t, "nonexistent", pluginNotFound.Name)
+func TestResolvePluginForInstallPreservesDiscoveryFailures(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":{"message":"plugin metadata response did not include plugin example"}}`))
+	}))
+	defer server.Close()
+	closedServer := httptest.NewServer(http.NotFoundHandler())
+	closedServer.Close()
+
+	for _, name := range []string{"authenticated transport", "anonymous transport", "anonymous server", "anonymous cancellation"} {
+		t.Run(name, func(t *testing.T) {
+			config := &TestConfig{}
+			config.InitConfig()
+			if name != "authenticated transport" {
+				config.Profile.APIKey = ""
+				config.Profile.AccountID = "saved-account"
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			baseURL := server.URL
+			if strings.Contains(name, "transport") {
+				baseURL = closedServer.URL
+			} else if name == "anonymous cancellation" {
+				cancel()
+			}
+			_, err := ResolvePluginForInstall(ctx, config, afero.NewMemMapFs(), "example", "", baseURL, baseURL)
+			switch name {
+			case "authenticated transport", "anonymous transport":
+				var transportErr *url.Error
+				require.ErrorAs(t, err, &transportErr)
+			case "anonymous server":
+				var requestErr requests.RequestError
+				require.ErrorAs(t, err, &requestErr)
+				require.Equal(t, http.StatusInternalServerError, requestErr.StatusCode)
+			case "anonymous cancellation":
+				require.ErrorIs(t, err, context.Canceled)
+			}
+			require.NotErrorIs(t, err, validators.ErrAPIKeyNotConfigured)
+			var notFound *ErrPluginNotFound
+			require.False(t, errors.As(err, &notFound))
+		})
+	}
 }
 
 func TestResolvePluginForInstallSucceedsForGAPluginWhenNotLoggedIn(t *testing.T) {
@@ -1088,6 +1432,107 @@ func TestCheckLatestPluginVersionSilentWhenLookupTimesOut(t *testing.T) {
 	}
 }
 
+// TestCheckLatestPluginVersionStillHintsUnderAnEnvironmentPluginsPath pins the one place
+// the two plugins-path guards deliberately disagree. maybeAutoUpgrade refuses to install
+// into a directory the user pointed the CLI at, whichever way they pointed it; the hint
+// only goes quiet for a localdev build, which has no published release to be behind.
+// Someone who relocated ordinary installs with the environment variable still wants to
+// hear that an upgrade exists -- all the more so now that they will not get it silently.
+func TestCheckLatestPluginVersionStillHintsUnderAnEnvironmentPluginsPath(t *testing.T) {
+	origPluginsPath := PluginsPath
+	origResolver := checkLatestPluginVersionResolver
+	PluginsPath = ""
+	t.Setenv("STRIPE_PLUGINS_PATH", "/somewhere/else")
+	checkLatestPluginVersionResolver = func(ctx context.Context, cfg cfgpkg.IConfig, fs afero.Fs, pluginName, apiBaseURL, dashboardBaseURL string) (*ResolvedPluginVersion, error) {
+		return &ResolvedPluginVersion{
+			Plugin: &Plugin{
+				Shortname: "myplugin",
+				Releases: []Release{
+					{Arch: runtime.GOARCH, OS: runtime.GOOS, Version: "1.1.0", Sum: "abc123"},
+				},
+			},
+			Version: "1.1.0",
+		}, nil
+	}
+	defer func() {
+		PluginsPath = origPluginsPath
+		checkLatestPluginVersionResolver = origResolver
+	}()
+
+	fs := afero.NewMemMapFs()
+	config := &TestConfig{}
+
+	plugin := Plugin{
+		Shortname:        "myplugin",
+		Binary:           "stripe-cli-myplugin",
+		MagicCookieValue: "MY-COOKIE",
+	}
+
+	pluginBinaryPath := fmt.Sprintf("/somewhere/else/myplugin/1.0.0/stripe-cli-myplugin%s", GetBinaryExtension())
+	require.NoError(t, fs.MkdirAll(filepath.Dir(pluginBinaryPath), 0755))
+	require.NoError(t, afero.WriteFile(fs, pluginBinaryPath, []byte("binary"), 0755))
+
+	output := captureStderr(t, func() {
+		CheckLatestPluginVersion(context.Background(), config, fs, plugin, stripe.DefaultAPIBaseURL, "")
+	})
+
+	require.Contains(t, output, "A newer version of the myplugin plugin is available")
+}
+
+func TestGetPluginsDirOverrides(t *testing.T) {
+	// TestConfig's config folder is "/", which is why every other test in this package
+	// finds plugins at /plugins without arranging anything. Joined rather than written
+	// out because this is the one case getPluginsDir builds a path for, and Windows
+	// builds it with the other separator. The overrides below are handed back verbatim,
+	// so they are the same string everywhere.
+	defaultPluginsDir := filepath.Join("/", "plugins")
+
+	tests := []struct {
+		name           string
+		pluginsPathEnv string
+		pluginsPath    string
+		want           string
+	}{
+		{
+			name: "neither, so the CLI's own config folder",
+			want: defaultPluginsDir,
+		},
+		{
+			name:           "the environment variable",
+			pluginsPathEnv: "/from/the/environment",
+			want:           "/from/the/environment",
+		},
+		{
+			name:        "a path compiled into a localdev build",
+			pluginsPath: "/compiled/in",
+			want:        "/compiled/in",
+		},
+		{
+			// The order these have always resolved in, kept because a variable set for
+			// one invocation is a narrower statement than one baked into a binary.
+			name:           "both, so the environment variable",
+			pluginsPathEnv: "/from/the/environment",
+			pluginsPath:    "/compiled/in",
+			want:           "/from/the/environment",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			origPluginsPath := PluginsPath
+			PluginsPath = tt.pluginsPath
+			t.Setenv("STRIPE_PLUGINS_PATH", tt.pluginsPathEnv)
+			defer func() { PluginsPath = origPluginsPath }()
+
+			require.Equal(t, tt.want, getPluginsDir(&TestConfig{}))
+
+			// What the auto-upgrade guard reads. Anything but the config folder is a
+			// directory the CLI was pointed at and must not install over.
+			require.Equal(t, tt.want != defaultPluginsDir, pluginsDirOverride() != "")
+		})
+	}
+}
+
 func TestCheckLatestPluginVersionSilentInDevMode(t *testing.T) {
 	origPluginsPath := PluginsPath
 	origResolver := checkLatestPluginVersionResolver
@@ -1120,6 +1565,141 @@ func TestCheckLatestPluginVersionSilentInDevMode(t *testing.T) {
 	})
 
 	require.Empty(t, output)
+}
+
+func TestCheckLatestPluginVersionSilentWhenPluginAutoUpdates(t *testing.T) {
+	origPluginsPath := PluginsPath
+	origUpdatesEnabled := pluginUpdatesEnabled
+	origResolver := checkLatestPluginVersionResolver
+	PluginsPath = ""
+	// A plugins directory the CLI has not been pointed at, which is what makes deferring
+	// to the pre-run check the right thing to do here. Pinned rather than assumed: the
+	// suppression this asserts is now conditional on it, so a stray variable in the
+	// environment running the tests would turn the whole test into its own opposite.
+	t.Setenv("STRIPE_PLUGINS_PATH", "")
+
+	var settingReads []string
+	pluginUpdatesEnabled = func(pluginName string, _ bool) bool {
+		settingReads = append(settingReads, pluginName)
+		return true
+	}
+	resolveCalls := 0
+	checkLatestPluginVersionResolver = func(ctx context.Context, cfg cfgpkg.IConfig, fs afero.Fs, pluginName, apiBaseURL, dashboardBaseURL string) (*ResolvedPluginVersion, error) {
+		resolveCalls++
+		return &ResolvedPluginVersion{
+			Plugin: &Plugin{
+				Shortname: "myplugin",
+				Releases: []Release{
+					{Arch: runtime.GOARCH, OS: runtime.GOOS, Version: "1.1.0", Sum: "abc123"},
+				},
+			},
+			Version: "1.1.0",
+		}, nil
+	}
+	defer func() {
+		PluginsPath = origPluginsPath
+		pluginUpdatesEnabled = origUpdatesEnabled
+		checkLatestPluginVersionResolver = origResolver
+	}()
+
+	fs := afero.NewMemMapFs()
+	config := &TestConfig{}
+
+	plugin := Plugin{
+		Shortname:        "myplugin",
+		Binary:           "stripe-cli-myplugin",
+		MagicCookieValue: "MY-COOKIE",
+		Releases: []Release{
+			{Arch: runtime.GOARCH, OS: runtime.GOOS, Version: "1.0.0", Sum: "abc123"},
+		},
+	}
+
+	pluginBinaryPath := fmt.Sprintf("/plugins/myplugin/1.0.0/stripe-cli-myplugin%s", GetBinaryExtension())
+	require.NoError(t, fs.MkdirAll(filepath.Dir(pluginBinaryPath), 0755))
+	require.NoError(t, afero.WriteFile(fs, pluginBinaryPath, []byte("binary"), 0755))
+
+	output := captureStderr(t, func() {
+		CheckLatestPluginVersion(context.Background(), config, fs, plugin, stripe.DefaultAPIBaseURL, "")
+	})
+
+	// This setup is exactly TestCheckLatestPluginVersionPrintsWhenUpgradeAvailable --
+	// 1.0.0 installed, 1.1.0 offered -- so the setting is the only thing keeping it
+	// quiet, and the hint text is not what is being suppressed here anyway.
+	require.Equal(t, []string{"myplugin"}, settingReads)
+	require.Empty(t, output)
+
+	// The point is the request, not just the message. A hint here would put a lookup on
+	// every command of an auto-updating plugin, which is the cost
+	// autoUpgradeCheckInterval exists to keep maybeAutoUpgrade from imposing.
+	require.Zero(t, resolveCalls)
+}
+
+// TestCheckLatestPluginVersionHintsWhenAutoUpgradeWillNotRun covers the one state where
+// both halves of the feature could go quiet at once: auto-update is on for the plugin, so
+// the hint would hand the job to the pre-run check, while the plugins directory is
+// overridden, so that check refuses it outright. Deferring to something that never runs
+// leaves the plugin silently out of date -- the single outcome neither guard is willing to
+// own, and the reason the suppression above asks whether the upgrade can happen at all.
+//
+// Distinct from the throttle, which is also a decline: that one is for this invocation and
+// the next one may well upgrade, so staying quiet costs nothing but a few hours. An
+// overridden directory is refused on every invocation, forever.
+func TestCheckLatestPluginVersionHintsWhenAutoUpgradeWillNotRun(t *testing.T) {
+	origPluginsPath := PluginsPath
+	origUpdatesEnabled := pluginUpdatesEnabled
+	origResolver := checkLatestPluginVersionResolver
+	PluginsPath = ""
+	t.Setenv("STRIPE_PLUGINS_PATH", "/somewhere/else")
+
+	var settingReads []string
+	pluginUpdatesEnabled = func(pluginName string, _ bool) bool {
+		settingReads = append(settingReads, pluginName)
+		return true
+	}
+	checkLatestPluginVersionResolver = func(ctx context.Context, cfg cfgpkg.IConfig, fs afero.Fs, pluginName, apiBaseURL, dashboardBaseURL string) (*ResolvedPluginVersion, error) {
+		return &ResolvedPluginVersion{
+			Plugin: &Plugin{
+				Shortname: "myplugin",
+				Releases: []Release{
+					{Arch: runtime.GOARCH, OS: runtime.GOOS, Version: "1.1.0", Sum: "abc123"},
+				},
+			},
+			Version: "1.1.0",
+		}, nil
+	}
+	defer func() {
+		PluginsPath = origPluginsPath
+		pluginUpdatesEnabled = origUpdatesEnabled
+		checkLatestPluginVersionResolver = origResolver
+	}()
+
+	fs := afero.NewMemMapFs()
+	config := &TestConfig{}
+
+	plugin := Plugin{
+		Shortname:        "myplugin",
+		Binary:           "stripe-cli-myplugin",
+		MagicCookieValue: "MY-COOKIE",
+		Releases: []Release{
+			{Arch: runtime.GOARCH, OS: runtime.GOOS, Version: "1.0.0", Sum: "abc123"},
+		},
+	}
+
+	pluginBinaryPath := fmt.Sprintf("/somewhere/else/myplugin/1.0.0/stripe-cli-myplugin%s", GetBinaryExtension())
+	require.NoError(t, fs.MkdirAll(filepath.Dir(pluginBinaryPath), 0755))
+	require.NoError(t, afero.WriteFile(fs, pluginBinaryPath, []byte("binary"), 0755))
+
+	output := captureStderr(t, func() {
+		CheckLatestPluginVersion(context.Background(), config, fs, plugin, stripe.DefaultAPIBaseURL, "")
+	})
+
+	require.Contains(t, output, "A newer version of the myplugin plugin is available")
+
+	// The setting is not read at all. Under an overridden directory it has nothing left to
+	// decide, and asserting that rules out passing for the neighboring reason -- a hint
+	// printed because the setting happened to be off rather than because the override
+	// took precedence over it.
+	require.Empty(t, settingReads)
 }
 
 func TestIsPluginCommand(t *testing.T) {
@@ -1194,6 +1774,126 @@ func testListEndpointResponseJSON() []byte {
   ]
 }`, runtime.GOOS, runtime.GOARCH))
 }
+
+func TestResolveInstallBaseURLs(t *testing.T) {
+	tests := []struct {
+		name             string
+		apiBaseURL       string
+		dashboardBaseURL string
+		wantAPI          string
+		wantDashboard    string
+	}{
+		{
+			// What Run is handed when the user passed no base URL flags at all, which is
+			// the usual case. An empty pair has to become a real host, not stay empty.
+			name:          "both empty fall back to this CLI's defaults",
+			wantAPI:       "https://api.stripe.com",
+			wantDashboard: "https://dashboard.stripe.com",
+		},
+		{
+			// The dashboard has to follow the API base URL. If it didn't, an --api-base
+			// pointed at QA would pair with production's dashboard.
+			name:          "dashboard follows an overridden api base",
+			apiBaseURL:    "https://qa-api.stripe.com",
+			wantAPI:       "https://qa-api.stripe.com",
+			wantDashboard: "https://qa-dashboard.stripe.com",
+		},
+		{
+			name:             "dashboard override stands on its own",
+			dashboardBaseURL: "https://qa-dashboard.stripe.com",
+			wantAPI:          "https://api.stripe.com",
+			wantDashboard:    "https://qa-dashboard.stripe.com",
+		},
+		{
+			name:             "both overrides pass through untouched",
+			apiBaseURL:       "https://qa-api.stripe.com",
+			dashboardBaseURL: "https://custom-dashboard.stripe.com",
+			wantAPI:          "https://qa-api.stripe.com",
+			wantDashboard:    "https://custom-dashboard.stripe.com",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotAPI, gotDashboard := resolveInstallBaseURLs(tt.apiBaseURL, tt.dashboardBaseURL)
+
+			require.Equal(t, tt.wantAPI, gotAPI)
+			require.Equal(t, tt.wantDashboard, gotDashboard)
+		})
+	}
+}
+
+// The cheap half of cancellation: a context that is already done should not reach
+// the network at all.
+func TestFetchRemoteResourceDoesNotRequestWithCanceledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	var requestCount atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount.Add(1)
+	}))
+	defer server.Close()
+
+	_, err := FetchRemoteResource(ctx, server.URL)
+
+	require.ErrorIs(t, err, context.Canceled)
+	require.Zero(t, requestCount.Load())
+}
+
+// The half that matters for Ctrl+C. A plugin binary is large enough that a wait
+// worth abandoning is a wait that has already gotten past the response headers, so
+// this cancels mid-body and asserts the transfer is actually torn down rather than
+// running to completion behind an error return.
+func TestFetchRemoteResourceCancelsDownloadInFlight(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	tornDown := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Headers and a first chunk, so the client is inside the body read rather than
+		// still waiting to hear back.
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("the first bytes of a plugin binary"))
+		w.(http.Flusher).Flush()
+
+		// Stands in for the rest of the download never arriving. Bounded so a
+		// regression cannot wedge httptest's Close, which waits on its handlers.
+		cancel()
+		select {
+		case <-r.Context().Done():
+			close(tornDown)
+		case <-time.After(cancellationTestTimeout):
+		}
+	}))
+	defer server.Close()
+
+	// Off the test goroutine, and bounded, because the whole point of the assertion
+	// is that this call returns at all. Waiting on it directly would turn a
+	// regression into a hung package instead of a failed test.
+	fetched := make(chan error, 1)
+	go func() {
+		_, err := FetchRemoteResource(ctx, server.URL)
+		fetched <- err
+	}()
+
+	select {
+	case err := <-fetched:
+		require.Error(t, err)
+	case <-time.After(cancellationTestTimeout):
+		t.Fatal("canceling the context did not stop the download")
+	}
+
+	select {
+	case <-tornDown:
+	case <-time.After(cancellationTestTimeout):
+		t.Fatal("canceling the context left the connection open")
+	}
+}
+
+// Long enough that a loaded CI machine will not trip it, short enough that a
+// regression reports itself rather than running out the package's test timeout.
+const cancellationTestTimeout = 15 * time.Second
 
 func captureStderr(t *testing.T, fn func()) string {
 	t.Helper()

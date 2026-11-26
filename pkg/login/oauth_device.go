@@ -3,11 +3,13 @@ package login
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"strings"
 	"time"
 
@@ -27,6 +29,11 @@ const (
 	StripeCLIClientIDProd = "oacli_V18aOD6v0hs9CU"
 	// StripeCLIClientIDQA is the registered OAuth client ID for the QA environment.
 	StripeCLIClientIDQA = "oacli_UjA5npk5UKXd9u"
+
+	// deviceTokenPollInterval is how often the token endpoint is polled while
+	// waiting for the user to approve the device login. A slow_down response
+	// still backs polling off (see PollDeviceToken).
+	deviceTokenPollInterval = 2 * time.Second
 )
 
 // OAuthError is a structured OAuth error returned by the access-srv token or
@@ -46,11 +53,23 @@ func (e *OAuthError) Error() string {
 
 // DeviceAuthResponse holds the device authorization endpoint response.
 type DeviceAuthResponse struct {
-	DeviceCode      string `json:"device_code"`
-	UserCode        string `json:"user_code"`
-	VerificationURI string `json:"verification_uri"`
-	ExpiresIn       int    `json:"expires_in"`
-	Interval        int    `json:"interval"`
+	DeviceCode              string `json:"device_code"`
+	UserCode                string `json:"user_code"`
+	VerificationURI         string `json:"verification_uri"`
+	VerificationURIComplete string `json:"verification_uri_complete"`
+	ExpiresIn               int    `json:"expires_in"`
+	Interval                int    `json:"interval"`
+}
+
+// BrowserURL returns the URL to display/open for the user to complete
+// authorization: VerificationURIComplete (which already has UserCode baked
+// in, so the user doesn't have to type it) when access-srv provides one,
+// falling back to VerificationURI otherwise.
+func (r *DeviceAuthResponse) BrowserURL() string {
+	if r.VerificationURIComplete != "" {
+		return r.VerificationURIComplete
+	}
+	return r.VerificationURI
 }
 
 // OAuthTokenResponse holds the token endpoint response.
@@ -95,18 +114,50 @@ func RequestDeviceCode(ctx context.Context, accessBaseURL, clientID string) (*De
 	return &authResp, nil
 }
 
-// PollDeviceToken polls the token endpoint until the user approves, ctx is
-// canceled or times out, or a terminal error is returned.
-//
-// Callers should create ctx with a deadline matching DeviceAuthResponse.ExpiresIn
-// to automatically stop polling when the device code expires.
-func PollDeviceToken(ctx context.Context, accessBaseURL, clientID, deviceCode string, interval time.Duration) (*OAuthTokenResponse, error) {
+// CheckDeviceToken makes a single, non-blocking request to the token endpoint and returns
+// immediately with whatever the server reports right now - unlike PollDeviceToken, it never
+// loops or sleeps waiting for the user to complete authentication. A non-nil *OAuthError with
+// Code "authorization_pending" or "slow_down" means the user hasn't completed authentication
+// yet, not that the device code is dead.
+func CheckDeviceToken(ctx context.Context, accessBaseURL, clientID, deviceCode string) (*OAuthTokenResponse, error) {
 	endpoint := accessBaseURL + accessAPNPath + "/token"
 	data := url.Values{}
 	data.Set("grant_type", "urn:ietf:params:oauth:grant-type:device_code")
 	data.Set("client_id", clientID)
 	data.Set("device_code", deviceCode)
 
+	resp, err := doPostForm(ctx, endpoint, data)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.StatusCode == http.StatusOK {
+		var tokenResp OAuthTokenResponse
+		if err := json.Unmarshal(body, &tokenResp); err != nil {
+			return nil, fmt.Errorf("failed to parse token response: %w", err)
+		}
+		return &tokenResp, nil
+	}
+
+	var errResp tokenErrorResponse
+	if jsonErr := json.Unmarshal(body, &errResp); jsonErr != nil || errResp.Error == "" {
+		return nil, errorcategory.Errorf(errorcategory.Auth, "token request failed (status %d): %s", resp.StatusCode, string(body))
+	}
+	return nil, &OAuthError{Code: errResp.Error, Description: errResp.ErrorDescription, HTTPStatus: resp.StatusCode}
+}
+
+// PollDeviceToken polls the token endpoint until the user approves, ctx is
+// canceled or times out, or a terminal error is returned.
+//
+// Callers should create ctx with a deadline matching DeviceAuthResponse.ExpiresIn
+// to automatically stop polling when the device code expires.
+func PollDeviceToken(ctx context.Context, accessBaseURL, clientID, deviceCode string, interval time.Duration) (*OAuthTokenResponse, error) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -114,42 +165,25 @@ func PollDeviceToken(ctx context.Context, accessBaseURL, clientID, deviceCode st
 		default:
 		}
 
-		resp, err := doPostForm(ctx, endpoint, data)
-		if err != nil {
+		tokenResp, err := CheckDeviceToken(ctx, accessBaseURL, clientID, deviceCode)
+		if err == nil {
+			return tokenResp, nil
+		}
+
+		var oauthErr *OAuthError
+		if !errors.As(err, &oauthErr) {
 			return nil, err
 		}
 
-		body, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			return nil, err
-		}
-
-		if resp.StatusCode == http.StatusOK {
-			var tokenResp OAuthTokenResponse
-			if err := json.Unmarshal(body, &tokenResp); err != nil {
-				return nil, fmt.Errorf("failed to parse token response: %w", err)
-			}
-			return &tokenResp, nil
-		}
-
-		var errResp tokenErrorResponse
-		if jsonErr := json.Unmarshal(body, &errResp); jsonErr != nil || errResp.Error == "" {
-			return nil, errorcategory.Errorf(errorcategory.Auth, "token request failed (status %d): %s", resp.StatusCode, string(body))
-		}
-
-		oauthErr := &OAuthError{Code: errResp.Error, Description: errResp.ErrorDescription, HTTPStatus: resp.StatusCode}
-
-		var wait time.Duration
-		switch errResp.Error {
+		switch oauthErr.Code {
 		case "authorization_pending":
-			wait = interval
 		case "slow_down":
-			wait = interval * 2
+			// Keep the longer interval for all later polls, per RFC 8628 section 3.5.
+			interval *= 2
 		default:
 			return nil, oauthErr
 		}
-		t := time.NewTimer(wait)
+		t := time.NewTimer(interval)
 		select {
 		case <-ctx.Done():
 			t.Stop()
@@ -168,137 +202,176 @@ func clientIDForAccessBaseURL(accessBaseURL string) string {
 	return StripeCLIClientIDProd
 }
 
-// LoginWithDeviceCode runs the full OAuth 2.1 device-code flow and saves credentials.
-func LoginWithDeviceCode(ctx context.Context, accessBaseURL string, cfg *config.Config) error {
-	clientID := clientIDForAccessBaseURL(accessBaseURL)
-	authResp, err := RequestDeviceCode(ctx, accessBaseURL, clientID)
+// RequestDeviceCodeForAccessBase requests a device code using the client ID registered for
+// accessBaseURL, returning that client ID alongside the response so callers can later poll for
+// the token with PollAndSaveDeviceCredentials.
+func RequestDeviceCodeForAccessBase(ctx context.Context, accessBaseURL string) (authResp *DeviceAuthResponse, clientID string, err error) {
+	clientID = clientIDForAccessBaseURL(accessBaseURL)
+	authResp, err = RequestDeviceCode(ctx, accessBaseURL, clientID)
+	return authResp, clientID, err
+}
+
+// DeviceCodeLoginResult holds the accounts and the active account/mode saved by a completed
+// OAuth device-code login.
+type DeviceCodeLoginResult struct {
+	Accounts          []config.AuthorizedAccount
+	ActiveAccountID   string
+	ActiveDisplayName string
+	ActiveLivemode    bool
+}
+
+// PollAndSaveDeviceCredentials polls the token endpoint until the user approves, ctx is
+// canceled, or ctx's deadline is exceeded, then saves the resulting OAuth credentials and
+// populates cfg's profile with the active account. Unlike LoginWithDeviceCode, it does not print
+// progress to stdout, so callers with their own UX (e.g. the RPC service) can drive completion
+// themselves.
+func PollAndSaveDeviceCredentials(ctx context.Context, accessBaseURL, clientID, deviceCode string, interval time.Duration, cfg *config.Config) (*DeviceCodeLoginResult, error) {
+	tokenResp, err := PollDeviceToken(ctx, accessBaseURL, clientID, deviceCode, interval)
 	if err != nil {
-		return fmt.Errorf("failed to request device code: %w", err)
-	}
-	if err := validateBrowserURL(authResp.VerificationURI, accessBaseURL); err != nil {
-		return err
+		return nil, err
 	}
 
-	color := ansi.Color(os.Stdout)
-	fmt.Printf("Your pairing code is: %s\n", color.Bold(authResp.UserCode))
-	fmt.Printf("To authorize the CLI, visit: %s\n", authResp.VerificationURI)
+	// The token has been issued, so from here on use a context detached from ctx's
+	// cancellation/deadline: a caller-side timeout (or the natural device-code expiry) firing at
+	// this exact moment shouldn't leave a valid token saved but the account list and active
+	// context unpopulated.
+	return saveDeviceCredentials(context.WithoutCancel(ctx), accessBaseURL, tokenResp, cfg)
+}
 
-	if !isSSH() && canOpenBrowser() {
-		fmt.Printf("Press Enter to open the browser (^C to quit)\n")
-		go func() {
-			fmt.Scanln() //nolint:errcheck
-			if err := openBrowser(authResp.VerificationURI); err != nil {
-				fmt.Fprintf(os.Stderr, "Failed to open browser: %s\n", err)
-			}
-		}()
-	}
-
-	interval := max(time.Duration(authResp.Interval)*time.Second, 5*time.Second)
-	expiresIn := max(time.Duration(authResp.ExpiresIn)*time.Second, 10*time.Minute)
-
-	pollCtx, cancel := context.WithTimeout(ctx, expiresIn)
-	defer cancel()
-
-	tokenResp, err := PollDeviceToken(pollCtx, accessBaseURL, clientID, authResp.DeviceCode, interval)
-	if err != nil {
-		if pollCtx.Err() != nil {
-			return errorcategory.Errorf(errorcategory.Auth, "device code expired; please run 'stripe login' again")
-		}
-		return err
-	}
+// saveDeviceCredentials persists a token endpoint response as the active credentials: it clears
+// any stale credentials, saves the new OAuth tokens, fetches the authorized accounts, and
+// populates cfg's profile with the active account/mode.
+func saveDeviceCredentials(ctx context.Context, accessBaseURL string, tokenResp *OAuthTokenResponse, cfg *config.Config) (*DeviceCodeLoginResult, error) {
+	// Clear all stale credentials before saving new ones, so this succeeds even if a
+	// previously stored credential is expired or revoked.
+	_ = cfg.RemoveAuthFields(cfg.Profile.ProfileName)
 
 	if err := saveOAuthCredentials(cfg, tokenResp); err != nil {
-		return fmt.Errorf("failed to save credentials: %w", err)
+		return nil, fmt.Errorf("failed to save credentials: %w", err)
 	}
 
 	accounts, err := ListAuthorizedAccounts(ctx, accessBaseURL, tokenResp.AccessToken)
 	if err != nil {
-		return fmt.Errorf("failed to fetch account info: %w", err)
+		return nil, fmt.Errorf("failed to fetch account info: %w", err)
 	}
 	activeID, activeLivemode := pickActiveContext(accounts)
 	if err := populateProfileFromAccounts(cfg, accounts, activeID, activeLivemode); err != nil {
-		return fmt.Errorf("failed to save account info: %w", err)
+		return nil, fmt.Errorf("failed to save account info: %w", err)
 	}
 
-	printLoginSuccess(accounts, activeID, activeLivemode)
+	return &DeviceCodeLoginResult{
+		Accounts:          accounts,
+		ActiveAccountID:   activeID,
+		ActiveDisplayName: cfg.Profile.DisplayName,
+		ActiveLivemode:    activeLivemode,
+	}, nil
+}
+
+// LoginWithDeviceCode runs the full OAuth 2.1 device-code flow and saves credentials.
+func LoginWithDeviceCode(ctx context.Context, accessBaseURL, apiBaseURL string, cfg *config.Config) error {
+	authResp, clientID, err := RequestDeviceCodeForAccessBase(ctx, accessBaseURL)
+	if err != nil {
+		return fmt.Errorf("failed to request device code: %w", err)
+	}
+	browserURL := authResp.BrowserURL()
+	if err := validateBrowserURL(browserURL, accessBaseURL); err != nil {
+		return err
+	}
+
+	fmt.Printf("To authorize, visit %s\n\n", browserURL)
+	if authResp.VerificationURIComplete != "" {
+		fmt.Println("When prompted, confirm your verification code:")
+	} else {
+		fmt.Println("When prompted, enter your verification code:")
+	}
+	fmt.Println()
+	fmt.Println(ansi.Purple(authResp.UserCode))
+	fmt.Println()
+
+	var browserOpened chan struct{}
+	if !isSSH() && canOpenBrowser() {
+		browserOpened = make(chan struct{})
+		fmt.Printf("Press enter to open the browser (^C to quit)\n")
+		go func() {
+			fmt.Scanln() //nolint:errcheck
+			if err := openBrowser(browserURL); err != nil {
+				fmt.Fprintf(os.Stderr, "Failed to open browser: %s\n", err)
+			}
+			close(browserOpened)
+		}()
+	}
+
+	interval := deviceTokenPollInterval
+	expiresIn := max(time.Duration(authResp.ExpiresIn)*time.Second, 10*time.Minute)
+
+	pollCtx, cancel := context.WithTimeout(ctx, expiresIn)
+	defer cancel()
+	waitCtx, stop := signal.NotifyContext(pollCtx, os.Interrupt)
+	defer stop()
+
+	stopSpinner := startSpinnerAfterSignal("Waiting for confirmation...", os.Stdout, browserOpened)
+	result, err := PollAndSaveDeviceCredentials(waitCtx, accessBaseURL, clientID, authResp.DeviceCode, interval, cfg)
+	stopSpinner()
+	if err != nil {
+		switch {
+		case errors.Is(err, context.Canceled):
+			ansi.ClearLine(os.Stdout)
+			fmt.Println("Canceled. Run 'stripe login' to try again.")
+			return nil
+		case pollCtx.Err() != nil:
+			return errorcategory.Errorf(errorcategory.Auth, "device code expired; please run 'stripe login' again")
+		default:
+			return err
+		}
+	}
+
+	uat, _ := cfg.Profile.GetUAT()
+	printAuthorizedSummary(ctx, apiBaseURL, &cfg.Profile, uat, result.Accounts)
 	warnIfInsecureStorage()
 	return nil
 }
 
-type contextRow struct {
-	name   string
-	mode   string
-	id     string
-	active bool
-}
-
-func buildContextRows(accounts []config.AuthorizedAccount, activeID string, activeLivemode bool) []contextRow {
-	activeMode := "test"
-	if activeLivemode {
-		activeMode = "live"
-	}
-	var rows []contextRow
+// totalAuthorizedContexts counts (account, mode) pairs across accounts, the
+// unit printAuthorizedSummary uses to decide how much detail to show.
+func totalAuthorizedContexts(accounts []config.AuthorizedAccount) int {
+	count := 0
 	for _, a := range accounts {
-		modes := a.Modes
-		if len(modes) == 0 {
-			modes = []string{"test"}
-		}
-		for _, m := range modes {
-			rows = append(rows, contextRow{
-				name:   a.Name,
-				mode:   m,
-				id:     a.ID,
-				active: a.ID == activeID && m == activeMode,
-			})
+		if len(a.Modes) == 0 {
+			count++
+		} else {
+			count += len(a.Modes)
 		}
 	}
-	return rows
+	return count
 }
 
-func printLoginSuccess(accounts []config.AuthorizedAccount, activeID string, activeLivemode bool) {
+// printAuthorizedSummary prints the "Done! ..." banner shared by login and
+// reauth. For a single authorized context it prints a short one-liner; for
+// more than one, it prints the same parent-grouped account list whoami,
+// login list, and switch use (see PrintAuthorizedAccounts) — including its
+// own "● active" marker, so there's no need to separately call out which
+// context is active.
+func printAuthorizedSummary(ctx context.Context, apiBaseURL string, profile *config.Profile, uat string, accounts []config.AuthorizedAccount) {
 	color := ansi.Color(os.Stdout)
-	rows := buildContextRows(accounts, activeID, activeLivemode)
 
-	if len(rows) == 0 {
-		fmt.Printf("%s Done! The Stripe CLI is configured with your OAuth credentials.\n", color.Green("✓"))
-		return
-	}
-
-	if len(rows) == 1 {
-		r := rows[0]
-		ctx := fmt.Sprintf("%s · %s", r.name, r.mode)
-		fmt.Printf("%s Done! The Stripe CLI is authorized for %s (%s)\n", color.Green("✓"), ctx, r.id)
-		fmt.Printf("  Active context: %s\n\n", ctx)
-		fmt.Println("Run 'stripe reauth' to change permissions or authorize access to additional accounts or sandboxes.")
-		return
-	}
-
-	fmt.Printf("%s Done! The Stripe CLI is authorized for %d contexts.\n\n", color.Green("✓"), len(rows))
-
-	nameW, modeW, idW := 0, 0, 0
-	for _, r := range rows {
-		if len(r.name) > nameW {
-			nameW = len(r.name)
+	switch totalAuthorizedContexts(accounts) {
+	case 0:
+		fmt.Printf("%s Done! The Stripe CLI is configured with your credentials.\n", color.Green("✓"))
+	case 1:
+		a := accounts[0]
+		mode := "test"
+		if len(a.Modes) > 0 {
+			mode = a.Modes[0]
 		}
-		if len(r.mode) > modeW {
-			modeW = len(r.mode)
-		}
-		if len(r.id) > idW {
-			idW = len(r.id)
-		}
+		fmt.Printf("%s Done! The Stripe CLI is authorized for %s · %s (%s)\n\n", color.Green("✓"), a.Name, displayMode(mode), a.ID)
+		fmt.Println("Run 'stripe login' to change permissions or authorize access to additional accounts or sandboxes.")
+	default:
+		fmt.Printf("%s Done!\n\n", color.Green("✓"))
+		PrintAuthorizedAccounts(ctx, apiBaseURL, profile, uat, accounts)
+		fmt.Println()
+		fmt.Println("Run 'stripe switch' to switch to a different account, or between live mode and a sandbox.")
+		fmt.Println("Run 'stripe login' to change permissions or authorize access to additional accounts or sandboxes.")
 	}
-
-	for _, r := range rows {
-		if r.active {
-			fmt.Printf("  %-*s  %-*s  %-*s  %s active\n", nameW, r.name, modeW, r.mode, idW, r.id, color.Green("●"))
-		} else {
-			fmt.Printf("  %-*s  %-*s  %s\n", nameW, r.name, modeW, r.mode, r.id)
-		}
-	}
-
-	fmt.Println()
-	fmt.Println("Run 'stripe switch context' to change your active context.")
-	fmt.Println("Run 'stripe reauth' to change permissions or authorize access to additional accounts or sandboxes.")
 }
 
 // RefreshAccessToken exchanges a refresh token for a new access token.

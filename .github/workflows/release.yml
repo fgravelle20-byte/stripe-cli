@@ -5,36 +5,91 @@ on:
     tags:
       - "v*"
 
-permissions:
-  contents: write
-  id-token: write # Required for OIDC to npm
+# No workflow-wide permissions: each job below opts in to only what it needs.
+# `contents: write` is limited to the three GoReleaser jobs that publish the
+# release, and `id-token: write` to the single job that publishes to npm.
+#
+# Every job that publishes uses the `release` environment and starts as soon as
+# canary-tests passes, so a release needs one approval.
+permissions: {}
 
 jobs:
   canary-tests:
     uses: ./.github/workflows/canary-test.yml
+    permissions:
+      contents: read
     with:
       run_api_tests: true
     secrets:
       STRIPE_TEST_API_KEY: ${{ secrets.STRIPE_TEST_API_KEY }}
 
-  approve-release:
+  # The build jobs below are gated on the `release` environment, so once canary
+  # tests pass they sit waiting for a reviewer. This job shares their `needs`
+  # but has no environment, so it runs at the moment they start waiting.
+  notify-approval-needed:
     needs: [canary-tests]
+    if: github.repository == 'stripe/stripe-cli'
     runs-on: ubuntu-latest
-    environment: release
+    permissions: {}
     steps:
-      - run: echo "Release approved, proceeding."
+      - name: Notify Slack
+        env:
+          ACTOR: ${{ github.actor }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TAG: ${{ github.ref_name }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_STRIPE_CLI_PRS_WEBHOOK_URL }}
+        shell: bash
+        run: |
+          if [ -z "$SLACK_WEBHOOK_URL" ]; then
+            echo "::warning::SLACK_STRIPE_CLI_PRS_WEBHOOK_URL is not set; skipping notification"
+            exit 0
+          fi
+
+          payload="$(
+            jq --null-input \
+              --arg actor "$ACTOR" \
+              --arg repository "$REPOSITORY" \
+              --arg run_url "$RUN_URL" \
+              --arg tag "$TAG" \
+              '
+                def slack_text:
+                  gsub("&"; "&amp;")
+                  | gsub("<"; "&lt;")
+                  | gsub(">"; "&gt;")
+                  | gsub("[\\r\\n]+"; " ");
+
+                {
+                  text: (
+                    ":hourglass_flowing_sand: Release *" + ($repository | slack_text) + "@" + ($tag | slack_text) + "* " +
+                    "is waiting for approval.\n" +
+                    "<" + $run_url + "|Review deployment> · Triggered by `" + ($actor | slack_text) + "`"
+                  )
+                }
+              '
+          )"
+
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            --header 'Content-Type: application/json' \
+            --data "$payload" \
+            "$SLACK_WEBHOOK_URL"
 
   build-mac:
-    needs: [approve-release]
+    needs: [canary-tests]
+    environment: release
     runs-on: macos-latest
+    permissions:
+      contents: write # GoReleaser publishes the GitHub release
     steps:
       - name: Code checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           fetch-depth: 0
+          persist-credentials: false
       - name: Generate GitHub App Token
         id: app-token
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           client-id: ${{ secrets.GH_APP_STRIPE_CLI_RELEASER_CLIENT_ID }}
           private-key: ${{ secrets.GH_APP_STRIPE_CLI_RELEASER_PRIVATE_KEY }}
@@ -43,32 +98,53 @@ jobs:
             stripe-cli
             homebrew-stripe-cli
             scoop-stripe-cli
+          # Request only what GoReleaser needs to commit the Homebrew formula.
+          permission-contents: write
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
-          go-version: 1.26.5
+          go-version: 1.27.3
+          # Never restore a cache into a job that publishes release artifacts.
+          cache: false
+      - name: Generate release notes
+        uses: ./.github/actions/generate-release-notes
+        with:
+          tag: ${{ github.ref_name }}
+          token: ${{ secrets.GITHUB_TOKEN }}
       - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v7
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
           distribution: goreleaser
           version: "~> v2"
-          args: release -f .goreleaser/mac.yml --clean
+          args: release -f .goreleaser/mac.yml --clean --release-notes=release-notes.md
         env:
+          STRIPE_CLI_RELEASE_SIGNING_KEY: ${{ secrets.STRIPE_CLI_RELEASE_SIGNING_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GORELEASER_GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          # Signing/notarization in .goreleaser/mac.yml is gated on MACOS_SIGN_P12
+          # being set, so omitting these silently ships unsigned binaries.
+          MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
+          MACOS_SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
 
   build-linux:
-    needs: [approve-release]
+    needs: [canary-tests]
+    environment: release
     runs-on: ubuntu-22.04
+    permissions:
+      contents: write # GoReleaser publishes the GitHub release
     env:
       # https://goreleaser.com/customization/docker_manifest/
       DOCKER_CLI_EXPERIMENTAL: "enabled"
 
     steps:
       - name: Code checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           fetch-depth: 0
+          persist-credentials: false
       -
         name: Docker Login
         env:
@@ -77,32 +153,44 @@ jobs:
         run: |
           echo "${DOCKER_PASSWORD}" | docker login --username "${DOCKER_USERNAME}" --password-stdin
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
-          go-version: 1.26.5
+          go-version: 1.27.3
+          # Never restore a cache into a job that publishes release artifacts.
+          cache: false
+      - name: Generate release notes
+        uses: ./.github/actions/generate-release-notes
+        with:
+          tag: ${{ github.ref_name }}
+          token: ${{ secrets.GITHUB_TOKEN }}
       - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v7
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
           distribution: goreleaser
           version: "~> v2"
-          args: release -f .goreleaser/linux.yml --clean
+          args: release -f .goreleaser/linux.yml --clean --release-notes=release-notes.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          STRIPE_CLI_RELEASE_SIGNING_KEY: ${{ secrets.STRIPE_CLI_RELEASE_SIGNING_KEY }}
           ARTIFACTORY_SECRET: ${{ secrets.ARTIFACTORY_SECRET }}
 
   build-windows:
-    needs: [approve-release]
+    needs: [canary-tests]
+    environment: release
     runs-on: windows-latest
+    permissions:
+      contents: write # GoReleaser publishes the GitHub release
     steps:
       - name: Code checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           fetch-depth: 0
+          persist-credentials: false
       - name: Generate GitHub App Token
         id: app-token
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           client-id: ${{ secrets.GH_APP_STRIPE_CLI_RELEASER_CLIENT_ID }}
           private-key: ${{ secrets.GH_APP_STRIPE_CLI_RELEASER_PRIVATE_KEY }}
@@ -111,17 +199,27 @@ jobs:
             stripe-cli
             homebrew-stripe-cli
             scoop-stripe-cli
+          # Request only what GoReleaser needs to commit the Scoop manifest.
+          permission-contents: write
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
-          go-version: 1.26.5
+          go-version: 1.27.3
+          # Never restore a cache into a job that publishes release artifacts.
+          cache: false
+      - name: Generate release notes
+        uses: ./.github/actions/generate-release-notes
+        with:
+          tag: ${{ github.ref_name }}
+          token: ${{ secrets.GITHUB_TOKEN }}
       - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v7
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
           distribution: goreleaser
           version: "~> v2"
-          args: release -f .goreleaser/windows.yml --clean
+          args: release -f .goreleaser/windows.yml --clean --release-notes=release-notes.md
         env:
+          STRIPE_CLI_RELEASE_SIGNING_KEY: ${{ secrets.STRIPE_CLI_RELEASE_SIGNING_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GORELEASER_GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
           # The GitHub App token is scoped to the stripe org and cannot create
@@ -131,9 +229,13 @@ jobs:
   upload-to-virustotal:
     needs: [build-windows]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read # only reads release assets
     steps:
       - name: Code checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
       - name: Upload to VirusTotal
         run: scripts/upload-zip-to-virustotal.sh
         shell: bash
@@ -142,14 +244,52 @@ jobs:
           VIRUSTOTAL_API_KEY: ${{ secrets.VIRUSTOTAL_API_KEY }}
 
   publish-npm:
-    needs: [build-mac, build-linux, build-windows]
+    # This job runs in the `release` environment so the npm OIDC token carries
+    # the environment claim. GitHub asks for approval on each job that uses a
+    # protected environment, and only groups jobs into one approval when they
+    # are pending at the same moment. So this job needs only canary-tests,
+    # which puts it in the same approval as the build jobs, and its first step
+    # waits for the builds instead of declaring them in `needs`.
+    needs: [canary-tests]
+    environment: release
     runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      actions: read # polls this run's build jobs
+      contents: read # downloads release assets
+      id-token: write # required for OIDC to npm
     steps:
+      - name: Wait for build jobs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          while true; do
+            # filter=latest returns the newest attempt of each job, so re-runs
+            # of failed builds are picked up.
+            if ! statuses=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?filter=latest&per_page=100" \
+                --jq '.jobs[] | select(.name | test("^build-(mac|linux|windows)$")) | "\(.name) \(.status) \(.conclusion)"'); then
+              echo "Failed to list jobs; retrying"
+              sleep 30
+              continue
+            fi
+            echo "$statuses"
+            if echo "$statuses" | awk '$2 == "completed" && $3 != "success" { found = 1 } END { exit !found }'; then
+              echo "::error::A build job did not succeed; not publishing to npm"
+              exit 1
+            fi
+            if [ "$(echo "$statuses" | awk '$2 == "completed" && $3 == "success"' | wc -l)" -eq 3 ]; then
+              break
+            fi
+            sleep 30
+          done
+
       - name: Code checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
 
       - name: Set up Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: '24'
           package-manager-cache: false
@@ -164,7 +304,9 @@ jobs:
           VERSION: ${{ env.VERSION }}
 
       - name: Stamp version into all package.json files
-        run: node npm/scripts/stamp-version.js ${{ env.VERSION }}
+        # VERSION comes from GITHUB_ENV above; read it as a shell variable so a
+        # crafted tag name cannot expand into the command line.
+        run: node npm/scripts/stamp-version.js "$VERSION"
 
       - name: Copy README into each package
         run: |

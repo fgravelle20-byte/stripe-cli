@@ -46,10 +46,33 @@ type ResolvedPluginVersion struct {
 	Plugin    *Plugin
 	Version   string
 	BinaryURL string
+	// CachedMetadata is true when the latest-version lookup failed and this
+	// version came from local metadata instead of Stripe's metadata endpoint.
+	CachedMetadata bool
+	// AutoInstall carries the backend's per-plugin setting for installing on first
+	// use without prompting. It is only ever true for a
+	// resolution that came from a live metadata response: a resolution that fell
+	// back to cached metadata leaves it false, so a machine that cannot reach the
+	// endpoint keeps prompting rather than installing on a stale answer.
+	AutoInstall bool
+	// AutoUpdateDefault is the backend default from a live metadata response.
+	// Cached metadata leaves it false; explicit user settings take precedence.
+	AutoUpdateDefault bool
 }
 
 // checkLatestPluginVersionResolver is swappable for test injection.
 var checkLatestPluginVersionResolver = ResolvePluginForUpgrade
+
+// hasOverrideAPIKey reports whether the API key was given for this command, via
+// --api-key or STRIPE_API_KEY, rather than saved by `stripe login`. An expired
+// key the user chose is reported rather than replaced by anonymous access, since
+// quietly succeeding would hide it until some other command fails on it.
+//
+// Swappable for test injection: TestConfig supplies its key through --api-key's
+// field, which would otherwise make every test key an override.
+var hasOverrideAPIKey = func(profile *config.Profile) bool {
+	return profile.HasOverrideAPIKey()
+}
 
 // checkLatestPluginVersionTimeout bounds the best-effort upgrade hint lookup so
 // plugin commands do not hang on exit when the metadata endpoint is slow.
@@ -76,11 +99,24 @@ func ValidatePluginShortname(pluginName string) error {
 	}
 }
 
+// HookBaseURLs are the base URL overrides a plugin hook may hear about: exactly
+// what the user explicitly passed on the command line, and empty otherwise. A
+// plugin reads an empty value as "use your own default", so these deliberately
+// never carry the defaults the CLI resolves for its own metadata requests —
+// forwarding those would replace a plugin's choice with the CLI's. They ride
+// the install chain so the hooks of dependencies installed along the way hear
+// the same overrides the plugin the user named does.
+type HookBaseURLs struct {
+	APIBaseURL       string
+	DashboardBaseURL string
+	AccessBaseURL    string
+}
+
 // Install installs the resolved plugin version. If the metadata lookup already
 // resolved a concrete binary URL, it reuses that result and skips a second
 // metadata request. Otherwise it retries metadata during install so cached
 // local metadata can still recover fresh release details.
-func (r *ResolvedPluginVersion) Install(ctx context.Context, config config.IConfig, fs afero.Fs, apiBaseURL, dashboardBaseURL string) error {
+func (r *ResolvedPluginVersion) Install(ctx context.Context, config config.IConfig, fs afero.Fs, apiBaseURL, dashboardBaseURL string, hookBaseURLs HookBaseURLs) error {
 	switch {
 	case r == nil:
 		return errorcategory.New(errorcategory.Internal, "missing resolved plugin version")
@@ -89,8 +125,17 @@ func (r *ResolvedPluginVersion) Install(ctx context.Context, config config.IConf
 	case r.Version == "":
 		return errorcategory.New(errorcategory.Internal, "missing plugin version")
 	default:
-		return r.Plugin.install(ctx, config, fs, r.Version, apiBaseURL, dashboardBaseURL, r.BinaryURL, r.BinaryURL != "")
+		chain := newInstallChain(hookBaseURLs)
+		defer chain.runDeferredHooks()
+		return r.install(ctx, config, fs, apiBaseURL, dashboardBaseURL, chain)
 	}
+}
+
+// install is Install without the entry-point guards or chain setup, for
+// dependency-chain callers that have already validated the resolution and hold
+// the chain to thread through.
+func (r *ResolvedPluginVersion) install(ctx context.Context, config config.IConfig, fs afero.Fs, apiBaseURL, dashboardBaseURL string, chain *installChain) error {
+	return r.Plugin.install(ctx, config, fs, r.Version, apiBaseURL, dashboardBaseURL, r.BinaryURL, r.BinaryURL != "", chain)
 }
 
 // GetBinaryExtension returns the appropriate file extension for plugin binary
@@ -102,22 +147,34 @@ func GetBinaryExtension() string {
 	return ""
 }
 
-// getPluginsDir computes where plugins are installed locally
-func getPluginsDir(config config.IConfig) string {
-	var pluginsDir string
-	tempEnvPluginsPath := os.Getenv("STRIPE_PLUGINS_PATH")
-
-	switch {
-	case tempEnvPluginsPath != "":
-		pluginsDir = tempEnvPluginsPath
-	case PluginsPath != "":
-		pluginsDir = PluginsPath
-	default:
-		configPath := config.GetConfigFolder(os.Getenv("XDG_CONFIG_HOME"))
-		pluginsDir = filepath.Join(configPath, "plugins")
+// pluginsDirOverride returns the directory plugins have been pointed at instead of the
+// CLI's own, or "" when they have not been.
+//
+// There are two ways to do that -- the STRIPE_PLUGINS_PATH environment variable, and
+// PluginsPath compiled in by a `localdev` build -- and anything deciding what the CLI may
+// do to a plugin directory has to ask about both. Checking only PluginsPath is what let
+// auto-upgrade overwrite a plugin under STRIPE_PLUGINS_PATH: the same directory, with
+// none of the protection, because the guard knew only the other spelling of it.
+//
+// The env var wins where both are set, matching the order these have always resolved in:
+// a variable set for one invocation is a narrower statement than one baked into a binary.
+func pluginsDirOverride() string {
+	if envPluginsPath := os.Getenv("STRIPE_PLUGINS_PATH"); envPluginsPath != "" {
+		return envPluginsPath
 	}
 
-	return pluginsDir
+	return PluginsPath
+}
+
+// getPluginsDir computes where plugins are installed locally
+func getPluginsDir(config config.IConfig) string {
+	if override := pluginsDirOverride(); override != "" {
+		return override
+	}
+
+	configPath := config.GetConfigFolder(os.Getenv("XDG_CONFIG_HOME"))
+
+	return filepath.Join(configPath, "plugins")
 }
 
 func getLocalPluginMetadataDir(config config.IConfig) string {
@@ -148,6 +205,9 @@ func snapshotInstalledPluginState(config config.IConfig, fs afero.Fs, pluginName
 		return installedPluginStateSnapshot{}, err
 	}
 
+	if err := checkPluginStorage(config, fs, metadataPath); err != nil {
+		return installedPluginStateSnapshot{}, err
+	}
 	body, err := afero.ReadFile(fs, metadataPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -180,19 +240,23 @@ func rollbackInstalledPluginState(config config.IConfig, fs afero.Fs, pluginName
 }
 
 func restoreLocalPluginMetadata(config config.IConfig, fs afero.Fs, pluginName string, snapshot installedPluginStateSnapshot) error {
-	if snapshot.hasLocalMetadata {
-		metadataPath, err := getLocalPluginMetadataPath(config, pluginName)
-		if err != nil {
-			return err
-		}
-
-		return afero.WriteFile(fs, metadataPath, snapshot.localMetadata, 0644)
+	if !snapshot.hasLocalMetadata {
+		return removeLocalPluginMetadata(config, fs, pluginName)
 	}
-
-	return removeLocalPluginMetadata(config, fs, pluginName)
+	metadataPath, err := getLocalPluginMetadataPath(config, pluginName)
+	if err != nil {
+		return err
+	}
+	if err := checkPluginStorage(config, fs, metadataPath); err != nil {
+		return err
+	}
+	return afero.WriteFile(fs, metadataPath, snapshot.localMetadata, 0644)
 }
 
 func restoreInstalledPluginList(config config.IConfig, installedPlugins []string) error {
+	if err := checkPluginStateWrite(config); err != nil {
+		return err
+	}
 	if stringSlicesEqual(config.GetInstalledPlugins(), installedPlugins) {
 		return nil
 	}
@@ -254,6 +318,13 @@ func GetInstalledPluginNames(config config.IConfig, fs afero.Fs) ([]string, erro
 
 // RecordInstalledPlugin ensures a plugin name is persisted in installed_plugins.
 func RecordInstalledPlugin(config config.IConfig, pluginName string) error {
+	if err := checkPluginStateWrite(config); err != nil {
+		return err
+	}
+	return recordInstalledPlugin(config, pluginName)
+}
+
+func recordInstalledPlugin(config config.IConfig, pluginName string) error {
 	if pluginName == "" {
 		return nil
 	}
@@ -271,6 +342,9 @@ func RecordInstalledPlugin(config config.IConfig, pluginName string) error {
 
 // RemoveInstalledPlugin removes a plugin name from installed_plugins if present.
 func RemoveInstalledPlugin(config config.IConfig, pluginName string) error {
+	if err := checkPluginStateWrite(config); err != nil {
+		return err
+	}
 	if pluginName == "" {
 		return nil
 	}
@@ -296,7 +370,11 @@ func RemoveInstalledPlugin(config config.IConfig, pluginName string) error {
 // PersistInstalledPluginState ensures local metadata and installed_plugins are
 // both updated for a locally installed plugin.
 func PersistInstalledPluginState(config config.IConfig, fs afero.Fs, plugin Plugin) error {
-	if err := ValidatePluginShortname(plugin.Shortname); err != nil {
+	pluginDir, err := plugin.getPluginInstallPath(config, "")
+	if err != nil {
+		return err
+	}
+	if err := checkPluginStorage(config, fs, pluginDir); err != nil {
 		return err
 	}
 
@@ -312,7 +390,10 @@ func PersistInstalledPluginState(config config.IConfig, fs afero.Fs, plugin Plug
 		return err
 	}
 
-	if err := RecordInstalledPlugin(config, plugin.Shortname); err != nil {
+	if err := checkPluginStorage(config, fs); err != nil {
+		return err
+	}
+	if err := recordInstalledPlugin(config, plugin.Shortname); err != nil {
 		if rollbackErr := rollbackInstalledPluginState(config, fs, plugin.Shortname, previousState); rollbackErr != nil {
 			return fmt.Errorf("failed to record installed plugin %s: %w; rollback failed: %v", plugin.Shortname, err, rollbackErr)
 		}
@@ -400,6 +481,9 @@ func BackfillMissingInstalledPluginMetadata(ctx context.Context, config config.I
 		if _, err := readLocalPluginMetadata(config, fs, pluginName); err == nil {
 			continue
 		} else if !os.IsNotExist(err) {
+			if IsUnsafePluginStorage(err) {
+				return err
+			}
 			log.WithFields(log.Fields{
 				"prefix": "plugins.BackfillMissingInstalledPluginMetadata",
 				"plugin": pluginName,
@@ -409,6 +493,9 @@ func BackfillMissingInstalledPluginMetadata(ctx context.Context, config config.I
 
 		installedVersion, err := (&Plugin{Shortname: pluginName}).lookUpInstalledVersion(config, fs)
 		if err != nil {
+			if IsUnsafePluginStorage(err) {
+				return err
+			}
 			log.WithFields(log.Fields{
 				"prefix": "plugins.BackfillMissingInstalledPluginMetadata",
 				"plugin": pluginName,
@@ -420,9 +507,15 @@ func BackfillMissingInstalledPluginMetadata(ctx context.Context, config config.I
 		}
 
 		manifestPlugin, manifestErr := lookUpPluginInCachedManifest(config, fs, pluginName)
+		if IsUnsafePluginStorage(manifestErr) {
+			return manifestErr
+		}
 		if manifestErr == nil {
 			if manifestPlugin.getReleaseForVersion(installedVersion) != nil {
 				if err := PersistInstalledPluginState(config, fs, manifestPlugin); err != nil {
+					if IsUnsafePluginStorage(err) {
+						return err
+					}
 					log.WithFields(log.Fields{
 						"prefix": "plugins.BackfillMissingInstalledPluginMetadata",
 						"plugin": pluginName,
@@ -446,8 +539,11 @@ func BackfillMissingInstalledPluginMetadata(ctx context.Context, config config.I
 			}).Debugf("could not read cached manifest plugin metadata before network fallback: %s", manifestErr)
 		}
 
-		resolvedPlugin, err := resolvePluginFromMetadata(ctx, config, fs, pluginName, installedVersion, apiBaseURL, dashboardBaseURL, apiKey)
+		resolvedPlugin, err := resolvePluginFromMetadata(ctx, config, fs, pluginName, installedVersion, apiBaseURL, dashboardBaseURL, apiKey, false)
 		if err != nil {
+			if IsUnsafePluginStorage(err) {
+				return err
+			}
 			log.WithFields(log.Fields{
 				"prefix":  "plugins.BackfillMissingInstalledPluginMetadata",
 				"plugin":  pluginName,
@@ -457,6 +553,9 @@ func BackfillMissingInstalledPluginMetadata(ctx context.Context, config config.I
 		}
 
 		if err := PersistInstalledPluginState(config, fs, *resolvedPlugin.Plugin); err != nil {
+			if IsUnsafePluginStorage(err) {
+				return err
+			}
 			log.WithFields(log.Fields{
 				"prefix":  "plugins.BackfillMissingInstalledPluginMetadata",
 				"plugin":  pluginName,
@@ -477,10 +576,7 @@ func LookUpPlugin(_ context.Context, config config.IConfig, fs afero.Fs, pluginN
 	}
 
 	if !os.IsNotExist(err) {
-		log.WithFields(log.Fields{
-			"prefix": "plugins.LookUpPlugin",
-			"plugin": pluginName,
-		}).Debugf("could not read local plugin metadata, falling back to cached manifest: %s", err)
+		return Plugin{}, err
 	}
 
 	plugin, manifestErr := lookUpPluginInCachedManifest(config, fs, pluginName)
@@ -492,8 +588,6 @@ func LookUpPlugin(_ context.Context, config config.IConfig, fs afero.Fs, pluginN
 	switch {
 	case errors.As(manifestErr, &pluginNotFound):
 		return Plugin{}, pluginNotFound
-	case !os.IsNotExist(err):
-		return Plugin{}, err
 	case os.IsNotExist(manifestErr):
 		return Plugin{}, &ErrPluginNotFound{Name: pluginName}
 	default:
@@ -502,21 +596,36 @@ func LookUpPlugin(_ context.Context, config config.IConfig, fs afero.Fs, pluginN
 }
 
 // ResolvePluginForInstall resolves the plugin metadata needed by `stripe plugin install`
-// using the metadata endpoint first and cached plugin metadata as fallback.
+// using the metadata endpoint first and cached plugin metadata as fallback. An
+// expired API key falls back to the anonymous metadata endpoint, so a plugin
+// anyone can install does not need a fresh login -- unless the key was given as
+// an override (see hasOverrideAPIKey), or no version was named and the plugin is
+// already installed. The anonymous endpoint's latest release can be older than
+// an installed one only the account can see, so that install would be the
+// silent downgrade ResolvePluginForUpgrade guards against.
 func ResolvePluginForInstall(ctx context.Context, config config.IConfig, fs afero.Fs, pluginName, version, apiBaseURL, dashboardBaseURL string) (*ResolvedPluginVersion, error) {
+	if err := checkPluginStorage(config, fs); err != nil {
+		return nil, err
+	}
 	if err := ValidatePluginShortname(pluginName); err != nil {
 		return nil, err
 	}
 
-	creds, err := config.GetProfile().ResolveCredentialsForAnyMode(false)
-	if err != nil && !errors.Is(err, validators.ErrAPIKeyNotConfigured) {
-		return nil, err
+	creds, credentialsErr := config.GetProfile().ResolveCredentialsForAnyMode(false)
+	if credentialsErr != nil && !errors.Is(credentialsErr, validators.ErrAPIKeyNotConfigured) {
+		return nil, credentialsErr
 	}
 	apiKey := creds.Token
 
-	resolvedPlugin, err := resolvePluginFromMetadata(ctx, config, fs, pluginName, version, apiBaseURL, dashboardBaseURL, apiKey)
+	anonymousOnExpiredKey := !hasOverrideAPIKey(config.GetProfile()) &&
+		(version != "" || (&Plugin{Shortname: pluginName}).InstalledVersion(config, fs) == "")
+	resolvedPlugin, err := resolvePluginFromMetadata(ctx, config, fs, pluginName, version, apiBaseURL, dashboardBaseURL, apiKey, anonymousOnExpiredKey)
 	if err == nil {
 		return resolvedPlugin, nil
+	}
+
+	if IsUnsafePluginStorage(err) || requiresNewerCLI(err) {
+		return nil, err
 	}
 
 	log.WithFields(log.Fields{
@@ -527,15 +636,9 @@ func ResolvePluginForInstall(ctx context.Context, config config.IConfig, fs afer
 
 	cachedPlugin, cachedErr := resolveCachedPluginForInstall(config, fs, pluginName, version)
 	if cachedErr == nil {
-		resolvedVersion := version
-		if resolvedVersion == "" {
-			resolvedVersion = cachedPlugin.LookUpLatestVersion()
-		}
-		if resolvedVersion == "" {
-			return nil, errorcategory.Errorf(errorcategory.API, "could not determine latest version for plugin %s", pluginName)
-		}
-		if cachedPlugin.getReleaseForVersion(resolvedVersion) == nil {
-			return nil, errorcategory.Errorf(errorcategory.API, "cached plugin metadata did not include plugin %s version %s for %s/%s", pluginName, resolvedVersion, runtime.GOOS, runtime.GOARCH)
+		resolvedVersion, versionErr := resolveVersionFromReleases(cachedPlugin, pluginName, version, cachedPluginMetadata)
+		if versionErr != nil {
+			return nil, versionErr
 		}
 
 		return &ResolvedPluginVersion{
@@ -544,16 +647,22 @@ func ResolvePluginForInstall(ctx context.Context, config config.IConfig, fs afer
 		}, nil
 	}
 
-	if normalizedErr := normalizePluginMetadataError(pluginName, err); normalizedErr != nil && os.IsNotExist(cachedErr) {
-		return nil, normalizedErr
+	var cachedNotFound *ErrPluginNotFound
+	if normalizedErr := normalizePluginMetadataError(pluginName, err); normalizedErr != nil && (os.IsNotExist(cachedErr) || errors.As(cachedErr, &cachedNotFound)) {
+		if errors.Is(credentialsErr, validators.ErrAPIKeyNotConfigured) {
+			return nil, errorcategory.Errorf(errorcategory.Auth, "%w: %w: %w", credentialsErr, normalizedErr, err)
+		}
+		return nil, errorcategory.Errorf(errorcategory.UserInput, "%w: %w", normalizedErr, err)
 	}
-
-	return nil, fmt.Errorf("could not resolve plugin %s via plugin metadata endpoint: %v; cached lookup failed: %w", pluginName, err, cachedErr)
+	return nil, fmt.Errorf("could not resolve plugin %s via plugin metadata endpoint: %w; cached lookup failed: %w", pluginName, err, cachedErr)
 }
 
 // ResolvePluginForUpgrade resolves the latest plugin metadata for
 // `stripe plugin upgrade` using the plugin metadata endpoint first and cached
-// plugin metadata as fallback.
+// plugin metadata as fallback. Unlike ResolvePluginForInstall, an expired API key
+// is not retried anonymously: the anonymous endpoint's latest release can be
+// older than one only the account can see, and upgrading to it would be a
+// silent downgrade.
 func ResolvePluginForUpgrade(ctx context.Context, config config.IConfig, fs afero.Fs, pluginName, apiBaseURL, dashboardBaseURL string) (*ResolvedPluginVersion, error) {
 	if err := ValidatePluginShortname(pluginName); err != nil {
 		return nil, err
@@ -565,9 +674,13 @@ func ResolvePluginForUpgrade(ctx context.Context, config config.IConfig, fs afer
 	}
 	apiKey := creds.Token
 
-	resolvedPlugin, endpointErr := resolvePluginFromMetadata(ctx, config, fs, pluginName, "", apiBaseURL, dashboardBaseURL, apiKey)
+	resolvedPlugin, endpointErr := resolvePluginFromMetadata(ctx, config, fs, pluginName, "", apiBaseURL, dashboardBaseURL, apiKey, false)
 	if endpointErr == nil {
 		return resolvedPlugin, nil
+	}
+
+	if IsUnsafePluginStorage(endpointErr) || requiresNewerCLI(endpointErr) {
+		return nil, endpointErr
 	}
 
 	log.WithFields(log.Fields{
@@ -577,14 +690,15 @@ func ResolvePluginForUpgrade(ctx context.Context, config config.IConfig, fs afer
 
 	cachedPlugin, cachedErr := resolveCachedPluginForUpgrade(config, fs, pluginName)
 	if cachedErr == nil {
-		version, versionErr := getLatestResolvedPluginVersion(pluginName, cachedPlugin)
+		version, versionErr := resolveVersionFromReleases(cachedPlugin, pluginName, "", cachedPluginMetadata)
 		if versionErr != nil {
 			return nil, versionErr
 		}
 
 		return &ResolvedPluginVersion{
-			Plugin:  cachedPlugin,
-			Version: version,
+			Plugin:         cachedPlugin,
+			Version:        version,
+			CachedMetadata: true,
 		}, nil
 	}
 
@@ -592,7 +706,7 @@ func ResolvePluginForUpgrade(ctx context.Context, config config.IConfig, fs afer
 		return nil, normalizedErr
 	}
 
-	return nil, fmt.Errorf("could not resolve plugin %s via plugin metadata endpoint: %v; cached lookup failed: %w", pluginName, endpointErr, cachedErr)
+	return nil, fmt.Errorf("could not resolve plugin %s via plugin metadata endpoint: %w; cached lookup failed: %w", pluginName, endpointErr, cachedErr)
 }
 
 func resolveCachedPluginForInstall(config config.IConfig, fs afero.Fs, pluginName, version string) (*Plugin, error) {
@@ -615,6 +729,9 @@ func readCachedPluginMetadata(config config.IConfig, fs afero.Fs, pluginName, lo
 	if err == nil {
 		localPlugin = &localPluginValue
 	} else if !os.IsNotExist(err) {
+		if IsUnsafePluginStorage(err) {
+			return nil, err
+		}
 		log.WithFields(log.Fields{
 			"prefix": logPrefix,
 			"plugin": pluginName,
@@ -623,6 +740,9 @@ func readCachedPluginMetadata(config config.IConfig, fs afero.Fs, pluginName, lo
 
 	var manifestPlugin *Plugin
 	manifestPluginValue, manifestErr := lookUpPluginInCachedManifest(config, fs, pluginName)
+	if IsUnsafePluginStorage(manifestErr) {
+		return nil, manifestErr
+	}
 	if manifestErr == nil {
 		manifestPlugin = &manifestPluginValue
 	} else {
@@ -708,10 +828,42 @@ func mergePluginMetadata(primary, fallback *Plugin) *Plugin {
 	return &pluginCopy
 }
 
+// resolveInstallBaseURLs fills in this CLI's own defaults for a download that
+// this package starts on its own, such as Run's auto-install.
+//
+// The base URLs threaded through Run hold only what the user explicitly passed,
+// because an empty value is what tells a plugin to fall back to its own default
+// instead of inheriting the CLI's. That convention does not survive a metadata
+// request, which has to name a real host. So the gaps are filled here rather
+// than in Run's arguments, leaving what gets forwarded to the plugin alone.
+func resolveInstallBaseURLs(apiBaseURL, dashboardBaseURL string) (resolvedAPIBaseURL, resolvedDashboardBaseURL string) {
+	resolvedAPIBaseURL = apiBaseURL
+	if resolvedAPIBaseURL == "" {
+		resolvedAPIBaseURL = stripe.DefaultAPIBaseURL
+	}
+
+	resolvedDashboardBaseURL = dashboardBaseURL
+	if resolvedDashboardBaseURL == "" {
+		resolvedDashboardBaseURL = stripe.DashboardBaseURLForAPIBaseURL(resolvedAPIBaseURL)
+	}
+
+	return resolvedAPIBaseURL, resolvedDashboardBaseURL
+}
+
+// resolvePluginForAutoInstall resolves the version to re-download for a plugin
+// that is already installed but whose binary is missing. This repairs a broken
+// install rather than adding a plugin the user never asked for, so it is
+// deliberately not gated on the metadata endpoint's auto_install answer.
 func resolvePluginForAutoInstall(ctx context.Context, config config.IConfig, fs afero.Fs, pluginName, apiBaseURL, dashboardBaseURL string) (*ResolvedPluginVersion, error) {
 	resolvedPlugin, err := ResolvePluginForInstall(ctx, config, fs, pluginName, "", apiBaseURL, dashboardBaseURL)
 	if err == nil {
 		return resolvedPlugin, nil
+	}
+
+	// Returning now also keeps the version the user needs out of this path's combined
+	// "latest lookup failed; cached lookup failed" wrapper, which buries it.
+	if requiresNewerCLI(err) {
+		return nil, err
 	}
 
 	log.WithFields(log.Fields{
@@ -724,7 +876,7 @@ func resolvePluginForAutoInstall(ctx context.Context, config config.IConfig, fs 
 		return nil, fmt.Errorf("could not resolve plugin %s for auto-install: latest lookup failed: %v; cached lookup failed: %w", pluginName, err, cachedErr)
 	}
 
-	version, versionErr := getLatestResolvedPluginVersion(pluginName, cachedPlugin)
+	version, versionErr := resolveVersionFromReleases(cachedPlugin, pluginName, "", cachedPluginMetadata)
 	if versionErr != nil {
 		return nil, versionErr
 	}
@@ -778,7 +930,8 @@ func comparePluginVersions(left, right string) int {
 	}
 }
 
-func resolvePluginFromMetadata(ctx context.Context, config config.IConfig, fs afero.Fs, pluginName, version, apiBaseURL, dashboardBaseURL, apiKey string) (*ResolvedPluginVersion, error) {
+// anonymousOnExpiredKey is passed through to requests.GetPluginMetadata.
+func resolvePluginFromMetadata(ctx context.Context, config config.IConfig, fs afero.Fs, pluginName, version, apiBaseURL, dashboardBaseURL, apiKey string, anonymousOnExpiredKey bool) (*ResolvedPluginVersion, error) {
 	if err := ValidatePluginShortname(pluginName); err != nil {
 		return nil, err
 	}
@@ -786,12 +939,24 @@ func resolvePluginFromMetadata(ctx context.Context, config config.IConfig, fs af
 	basePlugin := &Plugin{Shortname: pluginName}
 	if cachedPlugin, err := readLocalPluginMetadata(config, fs, pluginName); err == nil {
 		basePlugin = &cachedPlugin
+	} else if IsUnsafePluginStorage(err) {
+		return nil, err
 	} else if cachedPlugin, err := lookUpPluginInCachedManifest(config, fs, pluginName); err == nil {
 		basePlugin = &cachedPlugin
+	} else if IsUnsafePluginStorage(err) {
+		return nil, err
 	}
 
-	pluginMetadata, err := requests.GetPluginMetadata(ctx, apiBaseURL, dashboardBaseURL, stripe.APIVersion, apiKey, config.GetProfile(), pluginName, version, runtime.GOOS, runtime.GOARCH)
+	pluginMetadata, err := requests.GetPluginMetadata(ctx, apiBaseURL, dashboardBaseURL, stripe.APIVersion, apiKey, config.GetProfile(), pluginName, version, runtime.GOOS, runtime.GOARCH, anonymousOnExpiredKey)
 	if err != nil {
+		// Translated here rather than left to normalizePluginMetadataError, which only
+		// runs once the cached lookup has failed too. The endpoint is the only thing that
+		// knows this constraint, so its answer has to be captured where it arrives or it
+		// becomes an ordinary lookup failure and the cache gets to answer instead.
+		if minCoreVersion, requiresNewerCLI := requests.PluginRequiresNewerCLI(err); requiresNewerCLI {
+			return nil, newErrPluginRequiresNewerCLI(pluginName, version, minCoreVersion)
+		}
+
 		return nil, err
 	}
 
@@ -800,27 +965,32 @@ func resolvePluginFromMetadata(ctx context.Context, config config.IConfig, fs af
 		return nil, err
 	}
 
-	resolvedVersion := version
-	if resolvedVersion == "" {
-		resolvedVersion = plugin.LookUpLatestVersion()
-	}
-	if resolvedVersion == "" {
-		return nil, errorcategory.Errorf(errorcategory.API, "plugin metadata response did not include a release for %s on %s/%s", pluginName, runtime.GOOS, runtime.GOARCH)
-	}
-	if plugin.getReleaseForVersion(resolvedVersion) == nil {
-		return nil, errorcategory.Errorf(errorcategory.API, "plugin metadata response did not include plugin %s version %s for %s/%s", pluginName, resolvedVersion, runtime.GOOS, runtime.GOARCH)
+	resolvedVersion, err := resolveVersionFromReleases(plugin, pluginName, version, livePluginMetadata)
+	if err != nil {
+		return nil, err
 	}
 
+	// Per-release peer requirements ride on the response, not the manifest, so the
+	// plugin that resolution hands around (and install persists) picks them up here.
+	// Set unconditionally: a release that declares none must not inherit requirements
+	// cached from whichever release was installed before.
+	plugin.MinPluginVersions = pluginMetadata.MinPluginVersions
+
 	return &ResolvedPluginVersion{
-		Plugin:    plugin,
-		Version:   resolvedVersion,
-		BinaryURL: pluginMetadata.BinaryURL,
+		Plugin:            plugin,
+		Version:           resolvedVersion,
+		BinaryURL:         pluginMetadata.BinaryURL,
+		AutoInstall:       pluginMetadata.AutoInstall,
+		AutoUpdateDefault: pluginMetadata.AutoUpdateDefault,
 	}, nil
 }
 
 func getCachedPluginList(config config.IConfig, fs afero.Fs) (PluginList, error) {
 	var pluginList PluginList
 
+	if err := checkPluginStorage(config, fs, getCachedPluginManifestPath(config)); err != nil {
+		return pluginList, err
+	}
 	body, err := afero.ReadFile(fs, getCachedPluginManifestPath(config))
 	if err != nil {
 		return pluginList, err
@@ -834,17 +1004,43 @@ func getCachedPluginList(config config.IConfig, fs afero.Fs) (PluginList, error)
 	return *validatedPluginList, nil
 }
 
-func getLatestResolvedPluginVersion(pluginName string, plugin *Plugin) (string, error) {
+// Where a plugin's releases came from. Resolution treats the two identically and
+// only needs to tell them apart when reporting a version it could not find, since
+// a response that omitted a release and a cache that never held one are different
+// problems for the user.
+const (
+	livePluginMetadata   = "plugin metadata response"
+	cachedPluginMetadata = "cached plugin metadata"
+)
+
+// resolveVersionFromReleases picks the version to install out of a plugin's
+// releases: the one that was asked for, or the newest listed.
+//
+// Every resolve path shares it so they cannot drift apart, and is left describing
+// where the metadata came from rather than repeating the lookup itself. None of
+// them weighs a release's min_core_version; see ErrPluginRequiresNewerCLI.
+func resolveVersionFromReleases(plugin *Plugin, pluginName, requestedVersion, source string) (string, error) {
 	if plugin == nil {
-		return "", errorcategory.Errorf(errorcategory.API, "could not determine latest version for plugin %s", pluginName)
+		return "", errorcategory.Errorf(errorcategory.API, "%s did not include plugin %s", source, pluginName)
 	}
 
-	version := plugin.LookUpLatestVersion()
-	if version == "" {
-		return "", errorcategory.Errorf(errorcategory.API, "could not determine latest version for plugin %s", pluginName)
+	// Only a version the caller named has to be looked for. LookUpLatestVersion
+	// reports a version it read off a release for this platform, so asking the same
+	// releases to produce that release again can only ever succeed.
+	if requestedVersion == "" {
+		latestVersion := plugin.LookUpLatestVersion()
+		if latestVersion == "" {
+			return "", errorcategory.Errorf(errorcategory.API, "%s did not include a release for %s on %s/%s", source, pluginName, runtime.GOOS, runtime.GOARCH)
+		}
+
+		return latestVersion, nil
 	}
 
-	return version, nil
+	if plugin.getReleaseForVersion(requestedVersion) == nil {
+		return "", errorcategory.Errorf(errorcategory.API, "%s did not include plugin %s version %s for %s/%s", source, pluginName, requestedVersion, runtime.GOOS, runtime.GOARCH)
+	}
+
+	return requestedVersion, nil
 }
 
 func lookUpPluginInCachedManifest(config config.IConfig, fs afero.Fs, pluginName string) (Plugin, error) {
@@ -871,6 +1067,9 @@ func readLocalPluginMetadata(config config.IConfig, fs afero.Fs, pluginName stri
 		return Plugin{}, err
 	}
 
+	if err := checkPluginStorage(config, fs, metadataPath); err != nil {
+		return Plugin{}, err
+	}
 	body, err := afero.ReadFile(fs, metadataPath)
 	if err != nil {
 		return Plugin{}, err
@@ -890,8 +1089,14 @@ func writeLocalPluginMetadata(config config.IConfig, fs afero.Fs, plugin Plugin)
 		return err
 	}
 
+	if err := checkPluginStorage(config, fs, metadataPath); err != nil {
+		return err
+	}
 	pluginMetadataDir := getLocalPluginMetadataDir(config)
 	if err := fs.MkdirAll(pluginMetadataDir, 0755); err != nil {
+		return err
+	}
+	if err := checkPluginStorage(config, fs, metadataPath); err != nil {
 		return err
 	}
 
@@ -909,6 +1114,9 @@ func removeLocalPluginMetadata(config config.IConfig, fs afero.Fs, pluginName st
 		return err
 	}
 
+	if err := checkPluginStorage(config, fs, metadataPath); err != nil {
+		return err
+	}
 	err = fs.Remove(metadataPath)
 	if os.IsNotExist(err) {
 		return nil
@@ -918,6 +1126,9 @@ func removeLocalPluginMetadata(config config.IConfig, fs afero.Fs, pluginName st
 }
 
 func getLocalPluginMetadataNames(config config.IConfig, fs afero.Fs) ([]string, error) {
+	if err := checkPluginStorage(config, fs); err != nil {
+		return nil, err
+	}
 	entries, err := afero.ReadDir(fs, getLocalPluginMetadataDir(config))
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -933,6 +1144,9 @@ func getLocalPluginMetadataNames(config config.IConfig, fs afero.Fs) ([]string, 
 		}
 		if filepath.Ext(entry.Name()) != ".toml" {
 			continue
+		}
+		if err := checkPluginStorage(config, fs, filepath.Join(getLocalPluginMetadataDir(config), entry.Name())); err != nil {
+			return nil, err
 		}
 		names = append(names, strings.TrimSuffix(entry.Name(), ".toml"))
 	}
@@ -1022,8 +1236,11 @@ func normalizePluginMetadataError(pluginName string, err error) error {
 	}
 
 	var requestErr requests.RequestError
-	if errors.As(err, &requestErr) && requestErr.StatusCode == http.StatusNotFound {
-		return &ErrPluginNotFound{Name: pluginName}
+	if errors.As(err, &requestErr) {
+		if requestErr.StatusCode == http.StatusNotFound {
+			return &ErrPluginNotFound{Name: pluginName}
+		}
+		return nil
 	}
 
 	switch {
@@ -1043,14 +1260,19 @@ type ErrPluginNotFound struct {
 }
 
 func (e *ErrPluginNotFound) Error() string {
-	return fmt.Sprintf("no plugin named %q exists", e.Name)
+	return fmt.Sprintf("could not find an available release for plugin %q; check the plugin name and run 'stripe whoami' to verify the active account", e.Name)
 }
 
-// FetchRemoteResource returns the remote resource body
-func FetchRemoteResource(url string) ([]byte, error) {
+// FetchRemoteResource returns the remote resource body.
+//
+// The context covers the body transfer, not just getting a response, because the
+// resource this fetches is a plugin binary: by the time the wait is long enough to
+// be worth abandoning, the download has already started. Canceling only the
+// handshake would leave Ctrl+C with nothing to interrupt.
+func FetchRemoteResource(ctx context.Context, url string) ([]byte, error) {
 	t := &requests.TracedTransport{}
 
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 
 	if err != nil {
 		return nil, err
@@ -1091,9 +1313,60 @@ func FetchRemoteResource(url string) ([]byte, error) {
 
 // CheckLatestPluginVersion prints an upgrade hint to stderr if live metadata
 // has a newer version of the plugin than what is currently installed.
+//
+// It stays quiet for a plugin that auto-updates, whose owner asked the CLI to handle
+// upgrades rather than be told about them -- for as long as the CLI can actually handle
+// them, which the guard below is about. Where maybeAutoUpgrade already ran this
+// invocation, this is a second lookup of the same thing, ending in advice about an
+// upgrade the CLI just made. Where it did not run -- which is most invocations, since
+// it checks at most once per autoUpgradeCheckInterval -- this would spend exactly the
+// per-command request that throttle exists to avoid, and undo it from the other end.
+//
+// What that gives up is every case where the pre-run check knows a newer version exists
+// but declines to install it: a resolution from cached metadata, or the whole interval
+// after such a decline. Those runs now say nothing at all. The alternative is charging
+// every auto-updating command a request to say it, and a check that keeps declining is
+// better reported by the check itself than inferred from a hint here.
+//
+// When following the backend default, reuse the pre-run check's resolution. A
+// default of false still gets an upgrade hint, at the same interval as the check.
 func CheckLatestPluginVersion(ctx context.Context, config config.IConfig, fs afero.Fs, plugin Plugin, apiBaseURL, dashboardBaseURL string) {
+	// PluginsPath alone, deliberately narrower than the same-looking guard in
+	// maybeAutoUpgrade: a `localdev` build has no published release to be behind, but
+	// someone who merely relocated their plugins with STRIPE_PLUGINS_PATH still wants to
+	// hear about upgrades. Printing a line can only be wrong; installing over the
+	// directory can delete a build, which is why that side asks the broader question.
 	if PluginsPath != "" {
 		return
+	}
+
+	// Handing the job to the pre-run check, but only where that check will take it.
+	// maybeAutoUpgrade refuses a plugins directory the user pointed the CLI at, so
+	// deferring to it there would leave a plugin that auto-updates under
+	// STRIPE_PLUGINS_PATH with no upgrade and no word that one exists -- silently behind,
+	// on the strength of a setting asking for the opposite.
+	//
+	// Not the same as deferring across the throttle, which this still does: that decline
+	// is for the current invocation and some later one will upgrade, so the silence costs
+	// a few hours. An overridden directory is refused on every invocation there will ever
+	// be, so nothing arrives to break it.
+	//
+	// Asked of pluginsDirOverride rather than the environment directly, even though the
+	// guard above has already returned for the compiled-in half of it, so that this and
+	// maybeAutoUpgrade keep reading the same answer from the same place.
+	var resolvedPlugin *ResolvedPluginVersion
+	if pluginsDirOverride() == "" {
+		if pluginUpdatesEnabled(plugin.Shortname, false) {
+			return
+		}
+		if plugin.autoUpgradeCheck != nil && pluginUpdatesEnabled(plugin.Shortname, true) {
+			// With no explicit setting, reuse the pre-run decision. This also keeps
+			// throttled and failed checks from causing another request on exit.
+			resolvedPlugin = plugin.autoUpgradeCheck.resolved
+			if resolvedPlugin == nil || resolvedPlugin.AutoUpdateDefault {
+				return
+			}
+		}
 	}
 
 	installedVersion := plugin.InstalledVersion(config, fs)
@@ -1112,9 +1385,12 @@ func CheckLatestPluginVersion(ctx context.Context, config config.IConfig, fs afe
 	ctx, cancel := context.WithTimeout(ctx, checkLatestPluginVersionTimeout)
 	defer cancel()
 
-	resolvedPlugin, err := checkLatestPluginVersionResolver(ctx, config, fs, plugin.Shortname, apiBaseURL, dashboardBaseURL)
-	if err != nil {
-		return
+	if resolvedPlugin == nil {
+		var err error
+		resolvedPlugin, err = checkLatestPluginVersionResolver(ctx, config, fs, plugin.Shortname, apiBaseURL, dashboardBaseURL)
+		if err != nil || resolvedPlugin == nil {
+			return
+		}
 	}
 
 	latestVersion := resolvedPlugin.Version

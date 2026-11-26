@@ -198,9 +198,17 @@ func (c *Client) PerformRequest(ctx context.Context, method, path string, params
 		return nil, err
 	}
 
+	// Keep response metadata local to this event, not the shared invocation.
+	requestCtx := req.Context()
+	if metadata := GetEventMetadata(requestCtx); metadata != nil {
+		requestMetadata := *metadata
+		requestMetadata.HTTPOutcome = HTTPOutcomeForStatusCode(resp.StatusCode)
+		requestCtx = WithEventMetadata(requestCtx, &requestMetadata)
+	}
+
 	// RequestID of the API Request
 	requestID := resp.Header.Get("Request-Id")
-	go sendTelemetryEvent(ctx, requestID, c.Credentials.Livemode())
+	go sendTelemetryEvent(requestCtx, requestID, c.Credentials.Livemode())
 	return resp, nil
 }
 
@@ -232,15 +240,12 @@ func newHTTPClient(verbose bool, printableHeaders []string, unixSocket string) *
 
 	if unixSocket != "" {
 		unixSocket = expandUnixSocket(unixSocket)
-		dialFunc := func(network, addr string) (net.Conn, error) {
-			return net.Dial("unix", unixSocket)
-		}
 		dialContext := func(_ context.Context, _, _ string) (net.Conn, error) {
 			return net.Dial("unix", unixSocket)
 		}
 		httpTransport = &http.Transport{
 			DialContext:           dialContext,
-			DialTLS:               dialFunc,
+			DialTLSContext:        dialContext,
 			ResponseHeaderTimeout: 30 * time.Second,
 			ExpectContinueTimeout: 10 * time.Second,
 			TLSHandshakeTimeout:   10 * time.Second,

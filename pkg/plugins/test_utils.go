@@ -16,9 +16,18 @@ import (
 	"github.com/stripe/stripe-cli/pkg/requests"
 )
 
+// TestMachineUUID is the machine UUID a TestConfig reports unless a test sets
+// its own.
+const TestMachineUUID = "machine-uuid-for-tests"
+
 // TestConfig Implementations out several methods
 type TestConfig struct {
 	config.Config
+	MachineUUID string
+	// ConfigFolder overrides the config folder. Tests that run against the real
+	// filesystem must set it to a user-owned directory to pass the plugin
+	// storage trust check; the default "/" only suits an in-memory filesystem.
+	ConfigFolder string
 }
 
 type FailingWriteConfig struct {
@@ -48,6 +57,10 @@ func (c *FailingWriteConfig) WriteConfigField(field string, value interface{}) e
 
 // GetConfigFolder returns the absolute path for the TestConfig
 func (c *TestConfig) GetConfigFolder(xdgPath string) string {
+	if c.ConfigFolder != "" {
+		return c.ConfigFolder
+	}
+
 	return "/"
 }
 
@@ -59,6 +72,17 @@ func (c *TestConfig) GetInstalledPlugins() []string {
 // InitConfig initializes the config with the values we need
 func (c *TestConfig) InitConfig() {
 	c.Profile.APIKey = "rk_test_11111111111111111111111111"
+}
+
+// GetMachineUUID returns a fixed machine UUID. The real implementation reads and
+// writes global viper state to persist one, which these tests have no config file
+// for, so stand in for it here.
+func (c *TestConfig) GetMachineUUID() string {
+	if c.MachineUUID != "" {
+		return c.MachineUUID
+	}
+
+	return TestMachineUUID
 }
 
 // setUpFS Sets up a memMap that contains the manifest

@@ -25,6 +25,32 @@ func stripANSI(s string) string {
 }
 
 func TestSearchCommand(t *testing.T) {
+	// Exercise human-readable output regardless of the invoking environment.
+	for _, key := range []string{
+		"AI_AGENT",
+		"AGENT",
+		"ANTIGRAVITY_CLI_ALIAS",
+		"CLAUDECODE",
+		"CLAUDE_CODE_ENTRYPOINT",
+		"CLINE_ACTIVE",
+		"CODEX_CI",
+		"CODEX_INTERNAL_ORIGINATOR_OVERRIDE",
+		"CODEX_SANDBOX",
+		"CODEX_SANDBOX_NETWORK_DISABLED",
+		"CODEX_THREAD_ID",
+		"CURSOR_AGENT",
+		"GEMINI_CLI",
+		"GROK_AGENT",
+		"GROK_SESSION_ID",
+		"HERMES_AGENT",
+		"OPENCLAW_SHELL",
+		"OPENCODE",
+		"TERM_PROGRAM",
+		"KIRO_SESSION_ID",
+	} {
+		t.Setenv(key, "")
+	}
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, "/_endpoint/search", r.URL.Path)
 		assert.Equal(t, "payment methods", r.URL.Query().Get("query"))
@@ -59,6 +85,34 @@ func TestSearchCommand(t *testing.T) {
 	paymentIdx := strings.Index(plainOutput, "Accept a payment")
 	routeIdx := strings.Index(plainOutput, "stripe docs /payments/accept-a-payment")
 	assert.Less(t, paymentIdx, routeIdx)
+}
+
+func TestSearchCommand_AgentOutputIsPlain(t *testing.T) {
+	t.Setenv("CLAUDECODE", "1")
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"hits":[{"title":"Accept a payment","url":"https://docs.stripe.com/payments/accept-a-payment"},{"title":"Payment Element","url":"https://docs.stripe.com/payments/elements"}]}`)
+	}))
+	defer server.Close()
+
+	client := docs.NewClient("test").WithOptions(docs.WithBaseURL(server.URL))
+
+	var out bytes.Buffer
+	root := cmd.New().WithOptions(
+		cmd.WithClient(client),
+		cmd.WithConfig(&cliconfig.Config{Color: "on"}),
+	).Root()
+	root.SetOut(&out)
+	root.SetArgs([]string{"search", "payment methods"})
+
+	err := root.ExecuteContext(context.Background())
+	require.NoError(t, err)
+
+	output := out.String()
+	assert.Equal(t, "Accept a payment\nstripe docs /payments/accept-a-payment\nPayment Element\nstripe docs /payments/elements\n", output)
+	assert.NotContains(t, output, "\x1b[")
+	assert.NotContains(t, output, "•")
 }
 
 func TestSearchCommand_ColorOff(t *testing.T) {
